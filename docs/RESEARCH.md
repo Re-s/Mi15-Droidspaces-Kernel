@@ -387,3 +387,39 @@ Also fixed in the same pass:
   Because the redirect can change the flavor mid-run, later steps must gate on the effective
   value; `verify-build.sh` had additionally been receiving no root env at all, so its
   `CONFIG_KSU` / `CONFIG_KSU_SUSFS` / `CONFIG_KPM` assertions were being skipped silently.
+
+## 14. SukiSU `builtin` tip is not always buildable (observed in CI)
+
+Run `34029222515` compiled for **1095 seconds** and then failed in
+`drivers/kernelsu/ksu.o`:
+
+```
+kernel/feature/kernel_umount.c:13:20: error: use of undeclared identifier
+    'kernel_umount_feature_set'; did you mean 'kernel_umount_feature_get'?
+   13 |     .set_handler = kernel_umount_feature_set,
+-- SukiSU-Ultra version: 40901 [v4.2.0-e2912817@builtin]
+```
+
+Upstream bug, not a configuration problem. Bisected by fetching
+`kernel/feature/kernel_umount.c` at each commit that touched it:
+
+| commit | date | state |
+|---|---|---|
+| `e2912817` (v4.2.0, branch tip) | 2026-09-01 | broken |
+| **`d13e8a75`** "Sync with the official KernelSU main repo" | 2026-09-01 | **broke it** |
+| `1a884658` "Sync with the official KernelSU main repo" | 2026-08-27 | ok |
+| `82f6ada2`, `5168273c`, `ad8949ef` | 2026-04-01 | ok |
+
+`d13e8a75` removed `kernel_umount_feature_set()` but left the
+`.set_handler = kernel_umount_feature_set` reference in the handler struct.
+
+Resolution: `apply-root.sh` defaults SukiSU to **`1a884658`**, verified to still
+carry all 10 `KSU_SUSFS*` symbols plus `KPM`, and to have consistent get/set
+handlers across all five `kernel/feature/*.c` files. The `ksu_ref` input overrides it
+once upstream fixes the tip.
+
+Also added a **preflight symbol check**: every function named by a `*_handler =`
+assignment in `kernel/feature/*.c` must have a definition in the same file. This is
+the same failure class, and it otherwise only shows up ~18 minutes into the build
+when `drivers/kernelsu/ksu.o` is finally compiled. Verified to flag `d13e8a75` and
+pass `1a884658`.

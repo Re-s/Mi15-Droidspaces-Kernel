@@ -79,12 +79,22 @@ case "$ROOT_FLAVOR" in
     fi
     ;;
   sukisu)
-    echo "==> integrating SukiSU Ultra (branch: builtin)"
     # `builtin` is required: it carries the KSU_SUSFS* Kconfig symbols and the
     # KSU-side SUSFS implementation. The latest release tag (main) lacks them, and
     # kconfig would then silently drop every KSU_SUSFS entry we add below.
+    #
+    # But builtin's tip is not always buildable. Commit d13e8a75 ("Sync with the
+    # official KernelSU main repo", 2026-09-01, shipped in v4.2.0 / e2912817) dropped
+    # kernel_umount_feature_set() while leaving `.set_handler = kernel_umount_feature_set`
+    # in kernel/feature/kernel_umount.c, so drivers/kernelsu/ksu.o fails to compile:
+    #     error: use of undeclared identifier 'kernel_umount_feature_set'
+    # That surfaces ~18 minutes into the kernel build. So default to the last commit
+    # verified to build (1a884658, 2026-08-27), which still has every KSU_SUSFS symbol
+    # plus KPM. Override with KSU_REF to track the tip once upstream fixes it.
+    SUKISU_REF="${KSU_REF:-1a884658}"
+    echo "==> integrating SukiSU Ultra (branch builtin, ref: $SUKISU_REF)"
     curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
-        | bash -s builtin
+        | bash -s "$SUKISU_REF"
     KSU_DIR="$KROOT/KernelSU"
     set_y KSU
     [ "$USE_KPM" = "true" ] && { set_y KPM; echo "    KPM enabled"; }
@@ -95,6 +105,33 @@ esac
 [ -L "$KDIR/drivers/kernelsu" ] || { echo "::error::drivers/kernelsu symlink missing (setup.sh failed)"; exit 1; }
 grep -q kernelsu "$KDIR/drivers/Makefile" || { echo "::error::drivers/Makefile not wired"; exit 1; }
 echo "==> root driver wired: $(readlink "$KDIR/drivers/kernelsu")"
+echo "==> root revision: $(git -C "$KSU_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+
+# ---------------------------------------------------- preflight: handler symbols
+# Cheap static check for the failure that cost an 18-minute build: a feature handler
+# struct referencing a function that no longer exists. Upstream hit this in SukiSU
+# d13e8a75 (kernel_umount_feature_set removed, its .set_handler reference left behind),
+# and the compiler only complains once drivers/kernelsu/ksu.o is reached near the end
+# of the kernel build. Catching it here costs a second.
+missing=""
+for src in "$KSU_DIR"/kernel/feature/*.c; do
+    [ -f "$src" ] || continue
+    # Collect every function named by a *_handler assignment, then require a definition.
+    for fn in $(grep -oE '(get|set)_handler[[:space:]]*=[[:space:]]*[A-Za-z0-9_]+' "$src" \
+                | sed 's/.*=[[:space:]]*//' | sort -u); do
+        case "$fn" in NULL|0) continue ;; esac
+        grep -qE "^[a-zA-Z_].*[[:space:]]\*?${fn}[[:space:]]*\(" "$src" \
+            || missing="$missing $(basename "$src"):$fn"
+    done
+done
+if [ -n "$missing" ]; then
+    echo "::error::$ROOT_FLAVOR revision is not buildable: feature handler(s) reference undefined functions:"
+    for m in $missing; do echo "::error::  $m"; done
+    echo "::error::This is an upstream bug in the pinned root revision, not a config problem."
+    echo "::error::Pin a known-good commit via the ksu_ref input (SukiSU default: 1a884658)."
+    exit 1
+fi
+echo "==> feature handler symbols consistent"
 
 # ------------------------------------------------------------------- SUSFS
 if [ "$USE_SUSFS" = "true" ]; then
