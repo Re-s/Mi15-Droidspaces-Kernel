@@ -230,11 +230,12 @@ if [ "$USE_SUSFS" = "true" ]; then
     SUS="${SRC_CACHE:-/tmp}/susfs4ksu"
     if [ -d "$SUS/.git" ]; then
         echo "    susfs cache HIT ($SUS)"
-        # Full-history fetch (no --depth): gitlab refuses "fetch <sha>"
-        # (allowReachableSHA1InWant is off), so a shallow fetch cannot reach the
-        # pin. A full branch fetch is <1MB for this patches-only repo and makes
-        # every pinned revision checkout-able.
-        git -C "$SUS" fetch -q origin "$SUSFS_BRANCH" \
+        # Unshallow the clone: the cached one was seeded with --depth=1 by older
+        # revisions of this script, and a plain fetch does not deepen it - the
+        # shallow graft then hides the pin's ancestry and the ancestor check
+        # fails (run 34048417781). --unshallow also fetches new history and is a
+        # no-op on an already complete repo; this patches-only repo is <1MB.
+        git -C "$SUS" fetch -q --unshallow origin "$SUSFS_BRANCH" \
             || { echo "::error::susfs fetch of origin/$SUSFS_BRANCH failed"; exit 1; }
     else
         echo "    susfs cache MISS - cloning"
