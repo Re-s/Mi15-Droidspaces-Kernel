@@ -1,0 +1,190 @@
+name: Build Mi15 Droidspaces Kernel
+
+# Xiaomi 15 (dada, sm8750) - GKI android15-6.6 / KMI android15-8 / 4K pages
+# Stock reference: 6.6.118-android15-8-gb9cc6ec16bc8-abogki536571621-4k
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_tag:
+        description: "GKI source tag (sublevel). 118 = matches stock exactly"
+        type: choice
+        options:
+          - android15-6.6-2026-01_r1   # 6.6.118  <- stock
+          - android15-6.6-2026-04_r1   # 6.6.127
+          - android15-6.6-2026-07_r1   # 6.6.139
+        default: android15-6.6-2026-01_r1
+      root_flavor:
+        description: "Root solution"
+        type: choice
+        options:
+          - ksu-next     # KernelSU-Next (hooks built in, no KPM)
+          - sukisu       # SukiSU Ultra (supports KPM)
+          - none         # no root, Droidspaces only
+        default: ksu-next
+      ksu_ref:
+        description: "Root tag/commit to pin (blank = latest tag)"
+        type: string
+        default: ""
+      use_susfs:
+        description: "SUSFS root hiding"
+        type: boolean
+        default: true
+      use_kpm:
+        description: "KPM (SukiSU Ultra only; ignored for ksu-next)"
+        type: boolean
+        default: false
+      use_droidspaces:
+        description: "Droidspaces container support (kABI patch + configs)"
+        type: boolean
+        default: true
+      kernel_name:
+        description: "Kernel name, replaces kleaf's -maybe-dirty placeholder"
+        type: string
+        default: "-Mi15-DS"
+      formats:
+        description: "Artifact formats (comma list: bootimg,anykernel,image)"
+        type: string
+        default: "bootimg,anykernel,image"
+      make_release:
+        description: "Publish a GitHub Release"
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 180
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ubuntu-22.04 ships ~29GB free; a kleaf GKI tree + bazel cache needs ~50GB.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: false
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            git make bc bison flex libssl-dev libelf-dev python3 python-is-python3 \
+            cpio pahole libncurses-dev rsync curl zip unzip tar xz-utils gcc g++ gawk openssl
+
+      - name: Install repo tool
+        run: |
+          mkdir -p ~/bin
+          curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo -o ~/bin/repo
+          chmod a+x ~/bin/repo
+          echo "$HOME/bin" >>"$GITHUB_PATH"
+
+      - name: Resolve manifest branch
+        id: res
+        run: |
+          TAG='${{ inputs.kernel_tag }}'
+          # android15-6.6-2026-01_r1 -> common-android15-6.6-2026-01
+          MB="common-$(echo "$TAG" | sed -E 's/_r[0-9]+$//')"
+          echo "manifest_branch=$MB" >>"$GITHUB_OUTPUT"
+          echo "Manifest branch: $MB   tag: $TAG"
+
+      - name: Sync GKI source (pinned)
+        run: |
+          set -eux
+          mkdir -p ~/gki && cd ~/gki
+          repo init --depth=1 -u https://android.googlesource.com/kernel/manifest \
+              -b '${{ steps.res.outputs.manifest_branch }}'
+          # Belt and braces: pin kernel/common to the exact tag regardless of what
+          # the monthly manifest points at. Tracking a branch HEAD would let
+          # vermagic/CRCs drift away from the vendor modules -> bootloop.
+          mkdir -p .repo/local_manifests
+          cat >.repo/local_manifests/pin.xml <<LM
+          <manifest>
+            <remove-project name="kernel/common" />
+            <project path="common" name="kernel/common" revision="refs/tags/${{ inputs.kernel_tag }}" />
+          </manifest>
+          LM
+          repo sync -c -j"$(nproc --all)" --no-tags --no-clone-bundle --optimized-fetch --prune
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' common/Makefile | head -3
+
+      - name: Apply Droidspaces
+        if: ${{ inputs.use_droidspaces }}
+        run: ./scripts/apply-droidspaces.sh ~/gki/common
+
+      - name: Apply root solution
+        env:
+          ROOT_FLAVOR: ${{ inputs.root_flavor }}
+          USE_SUSFS: ${{ inputs.use_susfs }}
+          USE_KPM: ${{ inputs.use_kpm }}
+          KSU_REF: ${{ inputs.ksu_ref }}
+        run: ./scripts/apply-root.sh ~/gki
+
+      - name: Align config with stock environment
+        run: ./scripts/fix-gki-config.sh ~/gki '${{ inputs.kernel_name }}'
+
+      - name: Build kernel
+        run: |
+          set -eux
+          cd ~/gki
+          # savedefconfig gate: our fragment is appended, not sorted, so the check
+          # would fail on ordering alone.
+          grep -q 'check_defconfig = "disabled"' common/BUILD.bazel || \
+            sed -i '/name = "kernel_aarch64",/a\    check_defconfig = "disabled",' common/BUILD.bazel
+          # build/build.sh no longer exists on android15-6.6 manifests; kleaf only.
+          tools/bazel build --config=fast \
+            --disk_cache=/home/runner/.cache/bazel \
+            //common:kernel_aarch64/Image 2>&1 | tail -60
+
+      - name: Verify build
+        id: verify
+        run: ./scripts/verify-build.sh ~/gki
+
+      - name: Package artifacts
+        env:
+          IMAGE: ${{ steps.verify.outputs.image }}
+          OUTDIR: ${{ github.workspace }}/artifacts
+          FORMATS: ${{ inputs.formats }}
+          KERNEL_NAME: Mi15-Droidspaces
+          ROOT_FLAVOR: ${{ inputs.root_flavor }}
+        run: ./scripts/package.sh
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: mi15-${{ inputs.root_flavor }}-${{ steps.verify.outputs.kver }}
+          path: artifacts/*
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish release
+        if: ${{ inputs.make_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.verify.outputs.kver }}-${{ github.run_number }}
+          name: Mi15 Droidspaces ${{ steps.verify.outputs.kver }}
+          body: |
+            **Xiaomi 15 (dada)** GKI kernel — Droidspaces + root
+
+            | | |
+            |---|---|
+            | Kernel | `${{ steps.verify.outputs.kver }}` |
+            | Source tag | `${{ inputs.kernel_tag }}` |
+            | Root | `${{ inputs.root_flavor }}` (ref: `${{ inputs.ksu_ref || 'latest' }}`) |
+            | SUSFS | `${{ inputs.use_susfs }}` |
+            | KPM | `${{ inputs.use_kpm }}` |
+            | Droidspaces | `${{ inputs.use_droidspaces }}` |
+
+            Flash `boot.img`:
+            ```
+            fastboot flash boot boot.img
+            ```
+            Keep your stock boot.img — if it does not boot, flash the backup back.
+          files: artifacts/*

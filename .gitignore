@@ -1,0 +1,6 @@
+research/
+artifacts/
+*.log
+
+__pycache__/
+*.pyc

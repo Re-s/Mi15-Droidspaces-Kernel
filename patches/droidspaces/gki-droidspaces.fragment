@@ -1,0 +1,52 @@
+# Droidspaces GKI kernel config fragment
+# Source: Droidspaces-OSS Documentation/Kernel-Configuration.md#configuring-gki-kernels
+#
+# Every entry below was cross-checked against the STOCK config extracted from the
+# user's own Xiaomi 15 boot image (docs/stock-6.6.118-android15-8.config,
+# CONFIG_IKCONFIG payload at Image offset 18153600).
+#
+# Legend for the "stock" column:
+#   not-set  = "# CONFIG_X is not set" in stock  -> this fragment flips it on
+#   absent   = symbol not present in stock       -> newly selected (usually via a dep)
+#   already-y= stock already had it              -> listed for completeness/regression
+#
+# --- MANDATORY (Droidspaces refuses to start containers without these) ---
+CONFIG_SYSVIPC=y                        # stock: not-set   | kABI-sensitive, needs 001.*_6_7_8 patch
+CONFIG_POSIX_MQUEUE=y                   # stock: not-set   | kABI-safe on 6.6 (mq_bytes moved to ucounts)
+CONFIG_IPC_NS=y                         # stock: absent    | selected once SYSVIPC=y
+CONFIG_PID_NS=y                         # stock: not-set
+CONFIG_DEVTMPFS=y                       # stock: not-set   | Droidspaces needs it to build /dev
+CONFIG_CGROUP_DEVICE=y                  # stock: not-set   | "Fatal" per upstream table
+CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y    # stock: not-set   | NAT mode
+
+# --- OPTIONAL BUT RECOMMENDED (per upstream doc) ---
+CONFIG_USER_NS=y                        # stock: not-set   | fixes "docker unsafe procfs"
+CONFIG_TMPFS_POSIX_ACL=y                # stock: not-set   | NixOS rootfs support
+CONFIG_TMPFS_XATTR=y                    # stock: not-set   | NixOS rootfs support
+CONFIG_CGROUP_PIDS=y                    # stock: not-set
+
+# UFW support
+CONFIG_NETFILTER_XT_TARGET_REJECT=y     # stock: absent
+CONFIG_NETFILTER_XT_TARGET_LOG=y        # stock: not-set
+CONFIG_NETFILTER_XT_MATCH_RECENT=y      # stock: not-set
+
+# Fail2ban support
+CONFIG_IP_SET=y                         # stock: not-set
+CONFIG_IP_SET_HASH_IP=y                 # stock: absent
+CONFIG_IP_SET_HASH_NET=y                # stock: absent
+CONFIG_NETFILTER_XT_SET=y               # stock: absent
+
+# --- ALREADY ENABLED IN STOCK (asserted, not flipped) ---
+# CONFIG_NAMESPACES=y        CONFIG_UTS_NS=y      CONFIG_NET_NS=y
+# CONFIG_OVERLAY_FS=y        CONFIG_SECCOMP=y     CONFIG_SECCOMP_FILTER=y
+# CONFIG_CGROUPS=y           CONFIG_MEMCG=y       CONFIG_CGROUP_FREEZER=y
+# CONFIG_VETH=y              CONFIG_BRIDGE=y      CONFIG_NF_NAT=y
+# CONFIG_EXT4_FS=y           CONFIG_KPROBES=y     CONFIG_KALLSYMS_ALL=y
+#
+# NOTE: upstream's non-GKI list also asks for CONFIG_ANDROID_PARANOID_NETWORK=n,
+# CONFIG_NF_CONNTRACK_IPV4, CONFIG_NF_NAT_IPV4, CONFIG_IP_NF_NAT — all of those are
+# legacy/<=4.19 symbols and do not exist on 6.6. Do NOT add them here; the upstream
+# GKI section deliberately omits them.
+#
+# WARNING: upstream says "DO NOT enable anything other than the recommended GKI
+# configuration" — the kABI-safety argument only covers this exact set.
