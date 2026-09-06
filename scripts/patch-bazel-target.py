@@ -26,6 +26,10 @@ So this script only changes what `_define_common_kernel` really accepts:
   * kmi_symbol_list_strict_mode = False
       The Droidspaces kABI patch moves task_struct members into padding, shifting
       some CRCs by design; strict mode aborts on exactly that.
+  * trim_nonlisted_kmi = False
+      Stock (MiCode tree) exports ~7830 symbols; trimming to Google's KMI list
+      can drop symbols Xiaomi's prebuilt vendor_dlkm modules import ("unknown
+      symbol" at load). Keep every export the source tree has.
   * protected_exports_list / protected_modules_list dropped
       apply-root.sh deletes android/abi_gki_protected_exports_* so Google-signed
       system_dlkm modules (rfkill, bluetooth, ...) can load in a self-signed kernel.
@@ -95,6 +99,17 @@ def main() -> int:
             body += ","
         body += f'\n{indent}"kmi_symbol_list_strict_mode": False,'
 
+    body, n_trim = re.subn(
+        r'"trim_nonlisted_kmi":\s*[A-Za-z_][A-Za-z0-9_]*',
+        '"trim_nonlisted_kmi": False',
+        body,
+    )
+    if not n_trim and '"trim_nonlisted_kmi"' not in body:
+        body = body.rstrip()
+        if not body.endswith(","):
+            body += ","
+        body += f'\n{indent}"trim_nonlisted_kmi": False,'
+
     body = body.rstrip()
     if not body.endswith(","):
         body += ","
@@ -104,12 +119,14 @@ def main() -> int:
     open(path, "w", encoding="utf-8").write(out)
 
     print(f"    kmi_symbol_list_strict_mode -> False ({'replaced' if n_strict else 'added'})")
+    print(f"    trim_nonlisted_kmi -> False ({'replaced' if n_trim else 'added'})")
     if dropped:
         print(f"    removed: {', '.join(dropped)}")
 
     # Re-read and assert: a silent no-op must never pass again.
     check = open(path, encoding="utf-8").read()
-    if MARKER not in check or '"kmi_symbol_list_strict_mode": False' not in check:
+    if MARKER not in check or '"kmi_symbol_list_strict_mode": False' not in check \
+            or '"trim_nonlisted_kmi": False' not in check:
         print("::error::verification failed after write", file=sys.stderr)
         return 1
     print("    verified")

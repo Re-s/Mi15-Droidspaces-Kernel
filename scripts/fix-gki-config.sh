@@ -82,7 +82,25 @@ for c in KPROBES KALLSYMS KALLSYMS_ALL EXT4_FS; do
     fi
 done
 
-# 5. Disable the savedefconfig gate at its real source.
+# 5. MODVERSIONS must be OFF. This is the fix for the flashed-kernel black screen.
+#    Ground truth (research/ksymtab_crc2.py, stock Image vs AOSP-tag rebuild):
+#    87.8% of exported-symbol genksyms CRCs differ. Xiaomi builds their device
+#    kernel from MiCode's own tree, not the AOSP tag, and genksyms hashes SOURCE
+#    TOKENS - so no AOSP-tag rebuild can ever reproduce the CRCs their prebuilt
+#    vendor_dlkm modules record. A MODVERSIONS=y kernel then refuses every module
+#    at load ("disagrees about version of symbol") and the display/GPU never come
+#    up: exactly the observed boot-to-black-screen. With MODVERSIONS=n the CRC
+#    check is skipped entirely; what remains is binary-layout compatibility,
+#    which the ANDROID_KABI scheme guarantees (Droidspaces moves sysvipc into
+#    reserved slots - offsets and struct size are unchanged), and symbol
+#    presence is unaffected (exports still trimmed to the same KMI whitelist).
+#    caveat: this also means our own module ABI is unchecked; there are no
+#    out-of-tree modules of ours, so nothing is exposed.
+sed -i '/^CONFIG_MODVERSIONS=y$/d; /^# CONFIG_MODVERSIONS is not set$/d' "$DEFCONFIG"
+echo '# CONFIG_MODVERSIONS is not set' >>"$DEFCONFIG"
+echo "    MODVERSIONS: off (vendor module CRC parity is impossible across trees)"
+
+# 6. Disable the savedefconfig gate at its real source.
 #    We append options to gki_defconfig instead of inserting them in `savedefconfig`
 #    order, so the check fails on ordering alone:
 #        ERROR: savedefconfig does not match common/arch/arm64/configs/gki_defconfig

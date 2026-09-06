@@ -500,3 +500,34 @@ signs (two embedded vbmetas via `--do_not_append_vbmeta_image`), then adds the
 partition-level hash footer with `--partition_size 100663296`, which also pads
 the image to the real partition size so `fastboot flash boot` overwrites every
 stale byte. The verify block recomputes both digests from the final image.
+
+## 16. Black screen after flash: vendor module CRC parity is impossible - and unnecessary
+
+Symptom: `fastboot flash boot` with the signed image -> black screen right after
+the logo (kernel loads, display never comes up).
+
+Root cause chain, established by extracting `__ksymtab`/`__kcrctab` from both the
+stock Image and ours (research/ksymtab_crc2.py; entries are PREL32 12-byte
+`{value_offset, name_offset, namespace_offset}` relative to their own field
+address, `__kcrctab` follows `__ksymtab_strings`):
+
+* Stock exports 7830 symbols; **87.8% of the shared `__crc_` values differ** from
+  ours. `module_layout` and `wake_up_process` match, proving the parse is aligned.
+* Xiaomi builds their device kernel from MiCode's own tree, not the AOSP tag.
+  genksyms CRCs hash source tokens, so no AOSP-tag rebuild can ever reproduce
+  the CRCs recorded in their prebuilt vendor_dlkm modules.
+* With CONFIG_MODVERSIONS=y the kernel refuses every such module
+  ("disagrees about version of symbol") -> display/GPU dead -> black screen.
+* Verified non-factors: ANDROID_KABI_USE is CRC-neutral (include/linux/android_kabi.h
+  collapses to the original padding field under __GENKSYMS__), and `same_magic()`
+  skips the version part of vermagic for modules that carry CRCs.
+
+Fix (three parts, all serving "vendor modules must load"):
+1. `CONFIG_MODVERSIONS=n` - skip CRC checks entirely. Safety: genksyms hashes
+   source, not layout; binary-layout compatibility is what matters at runtime and
+   is guaranteed by the ANDROID_KABI scheme (Droidspaces fills reserved slots;
+   offsets/size unchanged). SUSFS verified .c-only (no struct changes), KSU likewise.
+2. `trim_nonlisted_kmi = False` - keep every export so modules never hit
+   "unknown symbol" against a trimmed table.
+3. Kernel release string equals stock (`-gb9cc6ec16bc8-abogki536571621-4k`) so
+   even modules without a `__versions` section pass the full vermagic compare.
