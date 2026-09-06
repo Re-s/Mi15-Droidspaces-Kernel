@@ -95,13 +95,74 @@ jobs:
           MB="common-$(echo "$TAG" | sed -E 's/_r[0-9]+$//')"
           echo "manifest_branch=$MB" >>"$GITHUB_OUTPUT"
           echo "Manifest branch: $MB   tag: $TAG"
+          # Effective root revision, for cache keying. Must match apply-root.sh's default.
+          REF='${{ inputs.ksu_ref }}'
+          FLAVOR='${{ inputs.root_flavor }}'
+          if [ "$FLAVOR" = "ksu-next" ] && [ '${{ inputs.use_susfs }}' = "true" ]; then
+            FLAVOR=sukisu   # apply-root.sh redirects this combination
+          fi
+          [ -n "$REF" ] || { [ "$FLAVOR" = "sukisu" ] && REF=6c5603f0 || REF=latest; }
+          echo "root_key=${FLAVOR}-${REF}" >>"$GITHUB_OUTPUT"
+          echo "Root cache key: ${FLAVOR}-${REF}"
+
+      # ---------------------------------------------------------------- caches
+      # Three caches, each invalidated only by its own pinned input:
+      #   git mirror  -> manifest branch + source tag (the ~1GB of repo objects)
+      #   root+susfs  -> resolved root revision
+      #   bazel       -> everything that affects codegen
+      #
+      # restore/save are split deliberately. actions/cache saves only when the job
+      # SUCCEEDS, and the builds that most need a warm cache are the ones that just
+      # failed. The save steps below run with `if: always()`, so a failed compile still
+      # leaves the downloaded sources (and any partial bazel output) for the next run.
+      - name: Restore git mirror
+        id: cache_git
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/gki-mirror
+          key: gitmirror-${{ steps.res.outputs.manifest_branch }}-${{ inputs.kernel_tag }}
+          restore-keys: |
+            gitmirror-${{ steps.res.outputs.manifest_branch }}-
+
+      - name: Restore root sources
+        id: cache_root
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/root-src
+          key: rootsrc-${{ steps.res.outputs.root_key }}-susfs${{ inputs.use_susfs }}-${{ github.run_id }}
+          restore-keys: |
+            rootsrc-${{ steps.res.outputs.root_key }}-susfs${{ inputs.use_susfs }}-
+
+      - name: Restore bazel cache
+        id: cache_bazel
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.cache/bazel-disk
+          # Every input that changes generated code belongs in this key, otherwise a
+          # stale object could be reused across differing configurations.
+          key: >-
+            bazel-${{ inputs.kernel_tag }}-${{ steps.res.outputs.root_key }}-ds${{ inputs.use_droidspaces }}-susfs${{ inputs.use_susfs }}-kpm${{ inputs.use_kpm }}-${{ hashFiles('scripts/*.sh', 'patches/droidspaces/*') }}-${{ github.run_id }}
+          restore-keys: |
+            bazel-${{ inputs.kernel_tag }}-${{ steps.res.outputs.root_key }}-ds${{ inputs.use_droidspaces }}-susfs${{ inputs.use_susfs }}-kpm${{ inputs.use_kpm }}-${{ hashFiles('scripts/*.sh', 'patches/droidspaces/*') }}-
+            bazel-${{ inputs.kernel_tag }}-${{ steps.res.outputs.root_key }}-ds${{ inputs.use_droidspaces }}-susfs${{ inputs.use_susfs }}-kpm${{ inputs.use_kpm }}-
+            bazel-${{ inputs.kernel_tag }}-${{ steps.res.outputs.root_key }}-
 
       - name: Sync GKI source (pinned)
         run: |
           set -eux
           mkdir -p ~/gki && cd ~/gki
+          # --reference against a cached mirror: repo hardlinks objects from it instead
+          # of refetching ~1GB. --dissociate keeps the worktree independent of the
+          # mirror afterwards, so a cache miss on a later run cannot corrupt the tree.
+          REFARG=""
+          if [ -d ~/gki-mirror/.repo ]; then
+            echo "git mirror cache HIT ($(du -sh ~/gki-mirror | cut -f1))"
+            REFARG="--reference=$HOME/gki-mirror --dissociate"
+          else
+            echo "git mirror cache MISS - full fetch"
+          fi
           repo init --depth=1 -u https://android.googlesource.com/kernel/manifest \
-              -b '${{ steps.res.outputs.manifest_branch }}'
+              -b '${{ steps.res.outputs.manifest_branch }}' $REFARG
           # Belt and braces: pin kernel/common to the exact tag regardless of what
           # the monthly manifest points at. Tracking a branch HEAD would let
           # vermagic/CRCs drift away from the vendor modules -> bootloop.
@@ -114,6 +175,21 @@ jobs:
           LM
           repo sync -c -j"$(nproc --all)" --no-tags --no-clone-bundle --optimized-fetch --prune
           grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL)' common/Makefile | head -3
+          du -sh ~/gki
+
+      # Refresh the mirror from the tree we just synced, so the next run can hardlink
+      # from it. Done as a bare mirror of .repo (that is where repo keeps the objects).
+      - name: Seed git mirror cache
+        run: |
+          set -eu
+          if [ ! -d ~/gki-mirror/.repo ]; then
+            mkdir -p ~/gki-mirror
+            cp -al ~/gki/.repo ~/gki-mirror/.repo 2>/dev/null \
+              || cp -a ~/gki/.repo ~/gki-mirror/.repo
+            echo "mirror seeded: $(du -sh ~/gki-mirror | cut -f1)"
+          else
+            echo "mirror already present, leaving as-is"
+          fi
 
       - name: Apply Droidspaces
         if: ${{ inputs.use_droidspaces }}
@@ -125,6 +201,8 @@ jobs:
           USE_SUSFS: ${{ inputs.use_susfs }}
           USE_KPM: ${{ inputs.use_kpm }}
           KSU_REF: ${{ inputs.ksu_ref }}
+          # Must resolve to the same directory as the ~/root-src cache path above.
+          SRC_CACHE: /home/runner/root-src
         run: ./scripts/apply-root.sh ~/gki
 
       - name: Align config with stock environment
@@ -144,9 +222,12 @@ jobs:
           # NB: `pipefail` is essential. Piping bazel into `tail` without it yields
           # tail's exit status, so a failed build reports success and the real error
           # only surfaces later as a confusing "built Image not found".
+          # --disk_cache must point at the cached directory, or the cache does nothing.
+          # This is what turns a repeat build from ~18 min into a few minutes.
           tools/bazel build --config=fast \
-            --disk_cache=/home/runner/.cache/bazel \
+            --disk_cache="$HOME/.cache/bazel-disk" \
             //common:kernel_aarch64/Image 2>&1 | tail -80
+          echo "bazel disk cache: $(du -sh "$HOME/.cache/bazel-disk" 2>/dev/null | cut -f1 || echo n/a)"
 
       - name: Verify build
         id: verify
@@ -167,6 +248,8 @@ jobs:
           FORMATS: ${{ inputs.formats }}
           KERNEL_NAME: Mi15-Droidspaces
           ROOT_FLAVOR: ${{ env.EFFECTIVE_ROOT_FLAVOR || inputs.root_flavor }}
+          # Reuse the cached AnyKernel3 clone instead of refetching it every run.
+          SRC_CACHE: /home/runner/root-src
         run: ./scripts/package.sh
 
       - name: Upload artifacts
@@ -176,6 +259,65 @@ jobs:
           path: artifacts/*
           if-no-files-found: error
           retention-days: 30
+
+      # All saves run with if: always() - a failed compile is exactly when the next run
+      # most needs these already downloaded.
+      #
+      # The git mirror is immutable for a given tag, so it is written once: skip the
+      # save when the exact key was already restored. The other two get refreshed every
+      # run and therefore use run-unique keys (see the note on the bazel save).
+      - name: Save git mirror
+        if: always() && steps.cache_git.outputs.cache-matched-key != format('gitmirror-{0}-{1}', steps.res.outputs.manifest_branch, inputs.kernel_tag)
+        uses: actions/cache/save@v4
+        with:
+          path: ~/gki-mirror
+          key: gitmirror-${{ steps.res.outputs.manifest_branch }}-${{ inputs.kernel_tag }}
+
+      - name: Save root sources
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/root-src
+          key: rootsrc-${{ steps.res.outputs.root_key }}-susfs${{ inputs.use_susfs }}-${{ github.run_id }}
+
+      # The save key carries a run-unique suffix. A cache key can only be written once,
+      # so reusing the restore key would make every later save a no-op — the disk cache
+      # would freeze at whatever the first run produced. The restore step finds these
+      # by prefix via restore-keys, which resolves to the most recent match.
+      - name: Save bazel cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.cache/bazel-disk
+          key: >-
+            bazel-${{ inputs.kernel_tag }}-${{ steps.res.outputs.root_key }}-ds${{ inputs.use_droidspaces }}-susfs${{ inputs.use_susfs }}-kpm${{ inputs.use_kpm }}-${{ hashFiles('scripts/*.sh', 'patches/droidspaces/*') }}-${{ github.run_id }}
+
+      # Run-unique keys accumulate, and a repo only gets 10GB of cache before GitHub
+      # starts evicting by LRU - which could evict the git mirror we want to keep.
+      # Prune our own older entries instead, newest two per prefix retained.
+      - name: Prune old caches
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -uo pipefail
+          for prefix in \
+            "bazel-${{ inputs.kernel_tag }}-${{ steps.res.outputs.root_key }}-" \
+            "rootsrc-${{ steps.res.outputs.root_key }}-" ; do
+            gh cache list --repo '${{ github.repository }}' --key "$prefix" \
+                --limit 100 --sort created_at --order desc \
+                --json id,key,sizeInBytes --jq '.[].id' 2>/dev/null \
+              | tail -n +3 \
+              | while read -r id; do
+                  [ -n "$id" ] || continue
+                  gh cache delete "$id" --repo '${{ github.repository }}' >/dev/null 2>&1 \
+                    && echo "  deleted cache $id" || true
+                done
+          done
+          echo "remaining caches:"
+          gh cache list --repo '${{ github.repository }}' --limit 30 \
+            --json key,sizeInBytes --jq '.[] | "  \(.sizeInBytes/1048576|floor)MB  \(.key)"' 2>/dev/null || true
 
       - name: Publish release
         if: ${{ inputs.make_release }}

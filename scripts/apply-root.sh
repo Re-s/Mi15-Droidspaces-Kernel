@@ -29,6 +29,52 @@ KDIR="$KROOT/common"
 [ -d "$KDIR/drivers" ] || { echo "::error::expected kernel tree at $KDIR"; exit 1; }
 DEFCONFIG="$KDIR/arch/arm64/configs/gki_defconfig"
 
+# Optional persistent source cache (CI caches this path). The root setup.sh scripts
+# always `git clone` into the kernel tree; pointing git at a cached mirror via
+# alternates lets them reuse objects instead of refetching every run.
+SRC_CACHE="${SRC_CACHE:-}"
+if [ -n "$SRC_CACHE" ]; then
+    mkdir -p "$SRC_CACHE"
+    echo "==> source cache: $SRC_CACHE"
+fi
+
+# Pre-place a cached clone at the exact path the upstream setup.sh expects, so it
+# skips the download entirely. Both setup.sh scripts do:
+#     test -d "$GKI_ROOT/<dir>" || git clone <url> <dir>
+# with NO --depth, then `git pull` — a full-history fetch every run. If the directory
+# already exists they only fetch what changed.
+#
+# Deliberately best-effort: any failure here just leaves the directory absent and
+# setup.sh clones normally. A cache must never be able to break the build.
+prime_clone() {
+    url="$1" name="$2" dest="$KROOT/$2"
+    [ -n "$SRC_CACHE" ] || return 0
+    cached="$SRC_CACHE/$name"
+    if [ -d "$cached/.git" ]; then
+        echo "    $name cache HIT ($(du -sh "$cached" 2>/dev/null | cut -f1))"
+    else
+        echo "    $name cache MISS - cloning into cache"
+        rm -rf "$cached"
+        git clone -q "$url" "$cached" 2>/dev/null || { rm -rf "$cached"; return 0; }
+    fi
+    # Hardlink the cached clone into place (cheap, same filesystem). setup.sh then
+    # sees an existing dir and only runs fetch/checkout against it.
+    rm -rf "$dest"
+    cp -al "$cached" "$dest" 2>/dev/null || cp -a "$cached" "$dest" 2>/dev/null || return 0
+}
+
+# After setup.sh has run, refresh the cache from the working clone so the next run
+# starts from an up-to-date copy.
+refresh_cache() {
+    name="$1" src="$KROOT/$1"
+    [ -n "$SRC_CACHE" ] || return 0
+    [ -d "$src/.git" ] || return 0
+    cached="$SRC_CACHE/$name"
+    rm -rf "$cached.new"
+    cp -al "$src" "$cached.new" 2>/dev/null || cp -a "$src" "$cached.new" 2>/dev/null || return 0
+    rm -rf "$cached" && mv "$cached.new" "$cached"
+}
+
 set_y() {
     local key="$1"
     sed -i "/^# CONFIG_${key} is not set$/d; /^CONFIG_${key}=/d" "$DEFCONFIG"
@@ -68,11 +114,13 @@ cd "$KROOT"
 case "$ROOT_FLAVOR" in
   ksu-next)
     echo "==> integrating KernelSU-Next (ref: ${KSU_REF:-latest tag})"
+    prime_clone https://github.com/KernelSU-Next/KernelSU-Next KernelSU-Next
     # setup.sh detects common/drivers, clones into ./KernelSU-Next, symlinks
     # drivers/kernelsu and edits drivers/{Makefile,Kconfig}.
     curl -LSs "https://raw.githubusercontent.com/KernelSU-Next/KernelSU-Next/stable/kernel/setup.sh" \
         | bash -s ${KSU_REF:+"$KSU_REF"}
     KSU_DIR="$KROOT/KernelSU-Next"
+    refresh_cache KernelSU-Next
     set_y KSU
     if [ "$USE_KPM" = "true" ]; then
         echo "::warning::KPM is a SukiSU Ultra feature; KernelSU-Next has no CONFIG_KPM. Ignoring USE_KPM."
@@ -101,9 +149,12 @@ case "$ROOT_FLAVOR" in
     # Override with KSU_REF to track the tip once upstream fixes it.
     SUKISU_REF="${KSU_REF:-6c5603f0}"
     echo "==> integrating SukiSU Ultra (branch builtin, ref: $SUKISU_REF)"
+    # setup.sh clones into $KROOT/KernelSU, so the cache entry uses that same name.
+    prime_clone https://github.com/SukiSU-Ultra/SukiSU-Ultra KernelSU
     curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
         | bash -s "$SUKISU_REF"
     KSU_DIR="$KROOT/KernelSU"
+    refresh_cache KernelSU
     set_y KSU
     [ "$USE_KPM" = "true" ] && { set_y KPM; echo "    KPM enabled"; }
     ;;
@@ -164,9 +215,21 @@ echo "==> feature subsystem coherent (handlers + enum refs)"
 # ------------------------------------------------------------------- SUSFS
 if [ "$USE_SUSFS" = "true" ]; then
     echo "==> integrating SUSFS (branch $SUSFS_BRANCH)"
-    SUS=/tmp/susfs4ksu
-    [ -d "$SUS" ] || git clone -q --depth=1 -b "$SUSFS_BRANCH" \
-        https://gitlab.com/simonpunk/susfs4ksu.git "$SUS"
+    # Keep the clone under $SRC_CACHE when provided (CI caches that directory), so
+    # repeat runs skip the download. /tmp is not persisted on a fresh runner.
+    SUS="${SRC_CACHE:-/tmp}/susfs4ksu"
+    if [ -d "$SUS/.git" ]; then
+        echo "    susfs cache HIT ($SUS)"
+        git -C "$SUS" fetch -q --depth=1 origin "$SUSFS_BRANCH" 2>/dev/null || true
+        git -C "$SUS" checkout -q -B "$SUSFS_BRANCH" FETCH_HEAD 2>/dev/null \
+            || git -C "$SUS" checkout -q "$SUSFS_BRANCH" 2>/dev/null || true
+    else
+        echo "    susfs cache MISS - cloning"
+        mkdir -p "$(dirname "$SUS")"
+        rm -rf "$SUS"
+        git clone -q --depth=1 -b "$SUSFS_BRANCH" \
+            https://gitlab.com/simonpunk/susfs4ksu.git "$SUS"
+    fi
     SUSFS_VER="$(grep -m1 'SUSFS_VERSION' "$SUS/kernel_patches/include/linux/susfs.h" | cut -d'"' -f2)"
     echo "    SUSFS version: $SUSFS_VER"
 

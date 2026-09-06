@@ -66,11 +66,25 @@ fi
 # --------------------------------------------------------------- AnyKernel3
 if has anykernel; then
     echo "==> building AnyKernel3 zip"
-    AK3="${AK3_DIR:-/tmp/AnyKernel3}"
-    if [ ! -d "$AK3" ]; then
+    # Prefer the persistent cache dir when CI provides one; /tmp is not preserved.
+    AK3="${AK3_DIR:-${SRC_CACHE:+$SRC_CACHE/AnyKernel3}}"
+    AK3="${AK3:-/tmp/AnyKernel3}"
+    if [ -d "$AK3/.git" ]; then
+        echo "    AnyKernel3 cache HIT"
+        git -C "$AK3" reset -q --hard && git -C "$AK3" clean -qfd
+    else
+        echo "    AnyKernel3 cache MISS - cloning"
+        rm -rf "$AK3"; mkdir -p "$(dirname "$AK3")"
         git clone --depth=1 -q https://github.com/osm0sis/AnyKernel3 "$AK3"
     fi
-    rm -rf "$AK3/.git"
+    # Build in a scratch copy so the cached clone keeps its .git for the next run.
+    # Keep it OUTSIDE $OUTDIR: anything left in there gets picked up by
+    # upload-artifact, and an early `exit 1` would skip a cleanup line at the end.
+    AK3_WORK="$(mktemp -d)"
+    trap 'rm -rf "$AK3_WORK"' EXIT
+    cp -a "$AK3/." "$AK3_WORK/"
+    rm -rf "$AK3_WORK/.git"
+    AK3="$AK3_WORK"
     cp -f "$IMAGE" "$AK3/Image"
 
     # Uppercase variable style: this is what the KSU/SukiSU in-app flashers parse.
@@ -125,14 +139,26 @@ AKSH
     ( cd "$AK3" && zip -r9 -q "$AKZIP" . -x '.git/*' )
 
     # Verify the zip: right kernel inside, install hooks present.
-    unzip -p "$AKZIP" anykernel.sh | grep -q '^BLOCK=boot' \
-        || { echo "::error::anykernel.sh missing BLOCK=boot"; exit 1; }
-    unzip -p "$AKZIP" anykernel.sh | grep -qE 'split_boot|flash_boot' \
-        || { echo "::error::anykernel.sh missing install calls"; exit 1; }
-    unzip -p "$AKZIP" Image | strings | grep -q "$KVER" \
-        || { echo "::error::wrong Image packed into zip"; exit 1; }
+    #
+    # NB: `grep -q` exits on its first match, which SIGPIPEs the upstream `unzip`/
+    # `strings`. Under `pipefail` that makes the whole pipeline return 141 even though
+    # the content is correct — a false failure that depends on where in the file the
+    # match happens to land. Use `grep -c` on a fully-consumed stream instead.
+    ak_sh="$(unzip -p "$AKZIP" anykernel.sh)"
+    case "$ak_sh" in
+        *"BLOCK=boot"*) : ;;
+        *) echo "::error::anykernel.sh missing BLOCK=boot"; exit 1 ;;
+    esac
+    case "$ak_sh" in
+        *split_boot*|*flash_boot*) : ;;
+        *) echo "::error::anykernel.sh missing install calls"; exit 1 ;;
+    esac
+    hits="$(unzip -p "$AKZIP" Image | strings | grep -c "$KVER" || true)"
+    [ "${hits:-0}" -gt 0 ] \
+        || { echo "::error::wrong Image packed into zip (version $KVER not found)"; exit 1; }
     echo "    AnyKernel3 OK"
     ls -lh "$AKZIP"
+    rm -rf "$AK3_WORK"; trap - EXIT
 fi
 
 # --------------------------------------------------------------- raw Image
