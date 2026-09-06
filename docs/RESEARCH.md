@@ -413,13 +413,39 @@ Upstream bug, not a configuration problem. Bisected by fetching
 `d13e8a75` removed `kernel_umount_feature_set()` but left the
 `.set_handler = kernel_umount_feature_set` reference in the handler struct.
 
-Resolution: `apply-root.sh` defaults SukiSU to **`1a884658`**, verified to still
-carry all 10 `KSU_SUSFS*` symbols plus `KPM`, and to have consistent get/set
-handlers across all five `kernel/feature/*.c` files. The `ksu_ref` input overrides it
-once upstream fixes the tip.
+`1a884658` turned out to be broken too, in a *different* way — run `34030854430`
+(20m40s) failed with:
 
-Also added a **preflight symbol check**: every function named by a `*_handler =`
-assignment in `kernel/feature/*.c` must have a definition in the same file. This is
-the same failure class, and it otherwise only shows up ~18 minutes into the build
-when `drivers/kernelsu/ksu.o` is finally compiled. Verified to flag `d13e8a75` and
-pass `1a884658`.
+```
+kernel/feature/kernel_umount.c:40:19: error: use of undeclared identifier
+    'KSU_FEATURE_WEBVIEW_ZYGOTE_UMOUNT'
+```
+
+That enum constant exists in **no** commit on the branch, yet `1a884658` and
+`2cf0f72d` reference it twice. The first pin was chosen by inspecting a single
+function symbol, which missed the enum problem entirely.
+
+Definitive scan: clone the branch and walk first-parent history, checking *both*
+`*_handler` function references and `KSU_FEATURE_*` enum references against their
+definitions in `kernel/include/uapi/feature.h`:
+
+| commit | date | verdict |
+|---|---|---|
+| `e2912817` (v4.2.0, tip) | 2026-09-01 | broken: `kernel_umount_feature_set` |
+| `d13e8a75` | 2026-09-01 | broken: `kernel_umount_feature_set` |
+| **`6c5603f0`** "fix 2" | 2026-08-27 | **clean — newest good commit** |
+| `e987e7d8` "fix" | 2026-08-27 | clean |
+| `2cf0f72d` | 2026-08-07 | broken: `KSU_FEATURE_WEBVIEW_ZYGOTE_UMOUNT` |
+| `1a884658` | 2026-08-27 | broken: `KSU_FEATURE_WEBVIEW_ZYGOTE_UMOUNT` |
+| `4a6d3401` and older | 2026-08-27 | clean |
+
+Resolution: SukiSU defaults to **`6c5603f0`**, verified to carry all 10 `KSU_SUSFS*`
+symbols, `KPM`, the `fs/susfs.c` detection in `kernel/Makefile`, and to have every
+`KSU_FEATURE_*` reference in the tree resolve. `ksu_ref` overrides it.
+
+The **preflight check now covers both failure modes** — handler functions *and* enum
+constants. One caveat that produced a false "every commit is broken" result while
+building it: `CONFIG_KSU_FEATURE_ADBROOT` is a Kconfig macro used in `#ifdef`, not an
+enum member, so the reference scan must exclude `CONFIG_`-prefixed matches.
+Verified: rejects `e2912817`, `d13e8a75`, `1a884658`, `2cf0f72d`; accepts `6c5603f0`
+and `4a6d3401`.

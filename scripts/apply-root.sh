@@ -83,15 +83,23 @@ case "$ROOT_FLAVOR" in
     # KSU-side SUSFS implementation. The latest release tag (main) lacks them, and
     # kconfig would then silently drop every KSU_SUSFS entry we add below.
     #
-    # But builtin's tip is not always buildable. Commit d13e8a75 ("Sync with the
-    # official KernelSU main repo", 2026-09-01, shipped in v4.2.0 / e2912817) dropped
-    # kernel_umount_feature_set() while leaving `.set_handler = kernel_umount_feature_set`
-    # in kernel/feature/kernel_umount.c, so drivers/kernelsu/ksu.o fails to compile:
-    #     error: use of undeclared identifier 'kernel_umount_feature_set'
-    # That surfaces ~18 minutes into the kernel build. So default to the last commit
-    # verified to build (1a884658, 2026-08-27), which still has every KSU_SUSFS symbol
-    # plus KPM. Override with KSU_REF to track the tip once upstream fixes it.
-    SUKISU_REF="${KSU_REF:-1a884658}"
+    # But builtin's tip is not always buildable, and the breakage is in
+    # kernel/feature/kernel_umount.c both times:
+    #   * d13e8a75 / e2912817 (v4.2.0, 2026-09-01): dropped kernel_umount_feature_set()
+    #     while keeping `.set_handler = kernel_umount_feature_set`
+    #         error: use of undeclared identifier 'kernel_umount_feature_set'
+    #   * 1a884658 and 2cf0f72d: reference KSU_FEATURE_WEBVIEW_ZYGOTE_UMOUNT, which is
+    #     not in the enum in kernel/include/uapi/feature.h
+    #         error: use of undeclared identifier 'KSU_FEATURE_WEBVIEW_ZYGOTE_UMOUNT'
+    # Both only surface ~18 minutes in, when drivers/kernelsu/ksu.o is finally compiled.
+    #
+    # 6c5603f0 ("fix 2", 2026-08-27) is the newest commit on builtin whose feature
+    # subsystem is self-consistent — verified by walking first-parent history and
+    # checking every KSU_FEATURE_* reference and *_handler function against its
+    # definitions. It still carries all 10 KSU_SUSFS symbols, KPM, and the
+    # fs/susfs.c detection in kernel/Makefile.
+    # Override with KSU_REF to track the tip once upstream fixes it.
+    SUKISU_REF="${KSU_REF:-6c5603f0}"
     echo "==> integrating SukiSU Ultra (branch builtin, ref: $SUKISU_REF)"
     curl -LSs "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
         | bash -s "$SUKISU_REF"
@@ -107,31 +115,51 @@ grep -q kernelsu "$KDIR/drivers/Makefile" || { echo "::error::drivers/Makefile n
 echo "==> root driver wired: $(readlink "$KDIR/drivers/kernelsu")"
 echo "==> root revision: $(git -C "$KSU_DIR" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 
-# ---------------------------------------------------- preflight: handler symbols
-# Cheap static check for the failure that cost an 18-minute build: a feature handler
-# struct referencing a function that no longer exists. Upstream hit this in SukiSU
-# d13e8a75 (kernel_umount_feature_set removed, its .set_handler reference left behind),
-# and the compiler only complains once drivers/kernelsu/ksu.o is reached near the end
-# of the kernel build. Catching it here costs a second.
+# ------------------------------------------- preflight: feature subsystem coherence
+# Two upstream breakages, both in kernel/feature/*.c, both invisible until
+# drivers/kernelsu/ksu.o compiles ~18 minutes into the kernel build:
+#   1. a *_handler struct member naming a function that no longer exists
+#   2. a KSU_FEATURE_* enum constant that is not in kernel/include/uapi/feature.h
+# Checking statically costs a second, so check both.
 missing=""
-for src in "$KSU_DIR"/kernel/feature/*.c; do
+FEATURE_H="$KSU_DIR/kernel/include/uapi/feature.h"
+if [ -f "$FEATURE_H" ]; then
+    enum_defs="$(grep -ohE '\bKSU_FEATURE_[A-Z0-9_]+' "$FEATURE_H" | sort -u)"
+else
+    enum_defs=""
+    echo "::warning::$FEATURE_H not found; skipping enum coherence check"
+fi
+
+for src in "$KSU_DIR"/kernel/feature/*.c "$KSU_DIR"/kernel/policy/feature.c; do
     [ -f "$src" ] || continue
-    # Collect every function named by a *_handler assignment, then require a definition.
+
+    # (1) every function named by a *_handler assignment must be defined in that file
     for fn in $(grep -oE '(get|set)_handler[[:space:]]*=[[:space:]]*[A-Za-z0-9_]+' "$src" \
                 | sed 's/.*=[[:space:]]*//' | sort -u); do
         case "$fn" in NULL|0) continue ;; esac
         grep -qE "^[a-zA-Z_].*[[:space:]]\*?${fn}[[:space:]]*\(" "$src" \
             || missing="$missing $(basename "$src"):$fn"
     done
+
+    # (2) every KSU_FEATURE_* enum reference must exist in the uapi header.
+    # Exclude CONFIG_KSU_FEATURE_* — those are Kconfig macros used in #ifdef, not enum
+    # members, and matching them naively flags every commit as broken.
+    [ -n "$enum_defs" ] || continue
+    for r in $(grep -oE '(^|[^A-Z_])KSU_FEATURE_[A-Z0-9_]+' "$src" \
+               | grep -oE 'KSU_FEATURE_[A-Z0-9_]+' | sort -u); do
+        printf '%s\n' "$enum_defs" | grep -qx "$r" || missing="$missing $(basename "$src"):$r"
+    done
 done
+
 if [ -n "$missing" ]; then
-    echo "::error::$ROOT_FLAVOR revision is not buildable: feature handler(s) reference undefined functions:"
+    echo "::error::$ROOT_FLAVOR revision $(git -C "$KSU_DIR" rev-parse --short HEAD 2>/dev/null) is not buildable."
+    echo "::error::Undefined symbols referenced by the feature subsystem:"
     for m in $missing; do echo "::error::  $m"; done
     echo "::error::This is an upstream bug in the pinned root revision, not a config problem."
-    echo "::error::Pin a known-good commit via the ksu_ref input (SukiSU default: 1a884658)."
+    echo "::error::Pin a known-good commit via the ksu_ref input (SukiSU default: 6c5603f0)."
     exit 1
 fi
-echo "==> feature handler symbols consistent"
+echo "==> feature subsystem coherent (handlers + enum refs)"
 
 # ------------------------------------------------------------------- SUSFS
 if [ "$USE_SUSFS" = "true" ]; then
