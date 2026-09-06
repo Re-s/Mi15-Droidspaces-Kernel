@@ -24,6 +24,16 @@ USE_SUSFS="${USE_SUSFS:-true}"
 USE_KPM="${USE_KPM:-false}"
 KSU_REF="${KSU_REF:-}"           # tag/commit; empty = latest tag
 SUSFS_BRANCH="${SUSFS_BRANCH:-gki-android15-6.6}"
+# Pin, do not chase. On 2026-09-06 upstream commit 3f0b811 ("kernel & KernelSU:
+# Fix [ksu_driver_su] being wrongly installed before su session") added a
+# ksu_install_su_fd() call to the 50_ kernel patch's exec.c hunk that only
+# newer KSU trees define; with the pinned SukiSU builtin@6c5603f0 the kernel
+# link fails: "undefined symbol: ksu_install_su_fd" (CI run 34046293618).
+# Two CI builds succeeded the same day only because they synced before that
+# commit landed. 8224c73 (its parent) is the newest gki-android15-6.6 revision
+# verified to not reference ksu_install_su_fd. Upgrade SUSFS_REF only together
+# with KSU_REF - the two pins must stay a coherent pair.
+SUSFS_REF="${SUSFS_REF:-8224c73}"
 
 KDIR="$KROOT/common"
 [ -d "$KDIR/drivers" ] || { echo "::error::expected kernel tree at $KDIR"; exit 1; }
@@ -220,16 +230,28 @@ if [ "$USE_SUSFS" = "true" ]; then
     SUS="${SRC_CACHE:-/tmp}/susfs4ksu"
     if [ -d "$SUS/.git" ]; then
         echo "    susfs cache HIT ($SUS)"
-        git -C "$SUS" fetch -q --depth=1 origin "$SUSFS_BRANCH" 2>/dev/null || true
-        git -C "$SUS" checkout -q -B "$SUSFS_BRANCH" FETCH_HEAD 2>/dev/null \
-            || git -C "$SUS" checkout -q "$SUSFS_BRANCH" 2>/dev/null || true
+        # Full-history fetch (no --depth): gitlab refuses "fetch <sha>"
+        # (allowReachableSHA1InWant is off), so a shallow fetch cannot reach the
+        # pin. A full branch fetch is <1MB for this patches-only repo and makes
+        # every pinned revision checkout-able.
+        git -C "$SUS" fetch -q origin "$SUSFS_BRANCH" \
+            || { echo "::error::susfs fetch of origin/$SUSFS_BRANCH failed"; exit 1; }
     else
         echo "    susfs cache MISS - cloning"
         mkdir -p "$(dirname "$SUS")"
         rm -rf "$SUS"
-        git clone -q --depth=1 -b "$SUSFS_BRANCH" \
+        git clone -q -b "$SUSFS_BRANCH" \
             https://gitlab.com/simonpunk/susfs4ksu.git "$SUS"
     fi
+    # Detach onto the pin and verify it really is part of the branch's history.
+    # A silent fallback to the moving tip is exactly the drift that broke
+    # run 34046293618 - any pin problem must fail loudly instead.
+    git -C "$SUS" cat-file -e "$SUSFS_REF^{commit}" 2>/dev/null \
+        || { echo "::error::SUSFS_REF $SUSFS_REF not found in origin/$SUSFS_BRANCH history"; exit 1; }
+    git -C "$SUS" merge-base --is-ancestor "$SUSFS_REF" "origin/$SUSFS_BRANCH" \
+        || { echo "::error::SUSFS_REF $SUSFS_REF is not an ancestor of origin/$SUSFS_BRANCH"; exit 1; }
+    git -C "$SUS" checkout -q --detach "$SUSFS_REF"
+    echo "    susfs pinned to $(git -C "$SUS" rev-parse --short HEAD)"
     SUSFS_VER="$(grep -m1 'SUSFS_VERSION' "$SUS/kernel_patches/include/linux/susfs.h" | cut -d'"' -f2)"
     echo "    SUSFS version: $SUSFS_VER"
 
