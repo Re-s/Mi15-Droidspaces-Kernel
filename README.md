@@ -35,7 +35,7 @@ Actions → **Build Mi15 Droidspaces Kernel** → *Run workflow*.
 | `kernel_tag` | `android15-6.6-2026-01_r1` | Source baseline. `…2026-01_r1` = **6.6.118, identical to stock**. Also `…2026-04_r1` (6.6.127) and `…2026-07_r1` (6.6.139) |
 | `root_flavor` | `ksu-next` | `ksu-next` / `sukisu` / `none` |
 | `ksu_ref` | *(empty)* | Pin the root solution to a tag/commit; empty = latest tag |
-| `use_susfs` | `true` | SUSFS root hiding (susfs4ksu `gki-android15-6.6`, v2.3.0) |
+| `use_susfs` | `true` | SUSFS root hiding (susfs4ksu `gki-android15-6.6`, v2.3.0). **Forces `root_flavor=sukisu`** — see below |
 | `use_kpm` | `false` | KPM — **SukiSU Ultra only**, ignored for `ksu-next` |
 | `use_droidspaces` | `true` | Droidspaces kABI patch + config set |
 | `kernel_name` | `-Mi15-DS` | Replaces kleaf's `-maybe-dirty` placeholder in `uname -r` |
@@ -69,6 +69,13 @@ The two root solutions are not interchangeable, and the difference is not cosmet
   from — older guides describing those options predate v3.x. `CONFIG_KSU` requires
   `KPROBES && EXT4_FS`, both already `=y` in stock.
   Branches are `stable` / `dev` / `legacy`; **there is no `next` branch**.
+- **SUSFS requires SukiSU Ultra.** susfs4ksu's KSU-side patch
+  (`10_enable_susfs_for_ksu.patch`) is written against weishu's original KernelSU layout —
+  it *deletes* `hook/lsm_hook.o`, `hook/syscall_hook_manager.o` and `infra/symbol_resolver.o`
+  from `kernel/Kbuild`, which are precisely the files KernelSU-Next v3.x is built on. KSU Next
+  also ships no kernel-side SUSFS of its own (only `userspace/ksud/src/susfsd.rs`). So
+  `root_flavor=ksu-next` + `use_susfs=true` is **automatically redirected to `sukisu`**, which
+  implements SUSFS natively. Set `use_susfs=false` to genuinely stay on KernelSU-Next.
 - **SukiSU Ultra** is what provides **KPM**. It is integrated from its `builtin` branch, which
   is the one carrying the `KSU_SUSFS*` symbols; the latest release tag on `main` lacks them and
   kconfig would silently drop every SUSFS option.

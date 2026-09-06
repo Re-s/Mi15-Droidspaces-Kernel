@@ -145,6 +145,14 @@ jobs:
 
       - name: Verify build
         id: verify
+        env:
+          # Use the EFFECTIVE values exported by apply-root.sh, not the raw inputs:
+          # ksu-next + SUSFS is redirected to sukisu, so gating on inputs.root_flavor
+          # would assert against a flavor that was never built.
+          ROOT_FLAVOR: ${{ env.EFFECTIVE_ROOT_FLAVOR || inputs.root_flavor }}
+          USE_KPM: ${{ env.EFFECTIVE_USE_KPM || inputs.use_kpm }}
+          USE_SUSFS: ${{ inputs.use_susfs }}
+          USE_DROIDSPACES: ${{ inputs.use_droidspaces }}
         run: ./scripts/verify-build.sh ~/gki
 
       - name: Package artifacts
@@ -153,13 +161,13 @@ jobs:
           OUTDIR: ${{ github.workspace }}/artifacts
           FORMATS: ${{ inputs.formats }}
           KERNEL_NAME: Mi15-Droidspaces
-          ROOT_FLAVOR: ${{ inputs.root_flavor }}
+          ROOT_FLAVOR: ${{ env.EFFECTIVE_ROOT_FLAVOR || inputs.root_flavor }}
         run: ./scripts/package.sh
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: mi15-${{ inputs.root_flavor }}-${{ steps.verify.outputs.kver }}
+          name: mi15-${{ env.EFFECTIVE_ROOT_FLAVOR || inputs.root_flavor }}-${{ steps.verify.outputs.kver }}
           path: artifacts/*
           if-no-files-found: error
           retention-days: 30
@@ -177,7 +185,7 @@ jobs:
             |---|---|
             | Kernel | `${{ steps.verify.outputs.kver }}` |
             | Source tag | `${{ inputs.kernel_tag }}` |
-            | Root | `${{ inputs.root_flavor }}` (ref: `${{ inputs.ksu_ref || 'latest' }}`) |
+            | Root | `${{ env.EFFECTIVE_ROOT_FLAVOR || inputs.root_flavor }}` (ref: `${{ inputs.ksu_ref || 'latest' }}`) |
             | SUSFS | `${{ inputs.use_susfs }}` |
             | KPM | `${{ inputs.use_kpm }}` |
             | Droidspaces | `${{ inputs.use_droidspaces }}` |

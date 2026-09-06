@@ -35,6 +35,24 @@ set_y() {
     echo "CONFIG_${key}=y" >>"$DEFCONFIG"
 }
 
+# ---------------------------------------------------- flavor/SUSFS compatibility
+# KernelSU-Next v3.x cannot take the susfs4ksu KSU-side patch. susfs4ksu's README
+# states its patches are built against "the original official KernelSU (the one
+# from weishu)" at a release tag, and 10_enable_susfs_for_ksu.patch expects that
+# older layout: it *deletes* hook/lsm_hook.o, hook/syscall_hook_manager.o and
+# infra/symbol_resolver.o from kernel/Kbuild, which are exactly the files v3.x is
+# built on. KernelSU-Next itself carries no kernel-side SUSFS (only
+# userspace/ksud/src/susfsd.rs), so there is nothing to enable either.
+# SukiSU Ultra's `builtin` branch ships the KSU_SUSFS* implementation itself and
+# needs no patch, so that is the supported route for SUSFS.
+if [ "$ROOT_FLAVOR" = "ksu-next" ] && [ "$USE_SUSFS" = "true" ]; then
+    echo "::warning::KernelSU-Next v3.x is structurally incompatible with the susfs4ksu"
+    echo "::warning::KSU-side patch (it targets weishu's older KernelSU layout)."
+    echo "::warning::Switching ROOT_FLAVOR to 'sukisu', which implements SUSFS natively."
+    echo "::warning::To keep KernelSU-Next instead, re-run with use_susfs=false."
+    ROOT_FLAVOR=sukisu
+fi
+
 if [ "$ROOT_FLAVOR" = "none" ]; then
     echo "==> ROOT_FLAVOR=none: stripping any KSU/KPM leftovers"
     sed -i -E '/^CONFIG_KSU[A-Z_]*=[ym]$/d; /^CONFIG_KPM=[ym]$/d' "$DEFCONFIG"
@@ -94,20 +112,28 @@ if [ "$USE_SUSFS" = "true" ]; then
     [ -f "$KPATCH" ] || { echo "::error::missing $KPATCH"; exit 1; }
     patch -p1 -d "$KDIR" <"$KPATCH"
 
-    # KSU-side patch: only KernelSU-Next needs it. SukiSU's builtin branch already
-    # implements SUSFS, and applying the patch there would collide.
-    if [ "$ROOT_FLAVOR" = "ksu-next" ]; then
-        KSUP="$SUS/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
-        if [ -f "$KSUP" ]; then
-            echo "    applying KSU-side SUSFS patch"
-            if ! patch -p1 -d "$KSU_DIR" --dry-run <"$KSUP" >/dev/null 2>&1; then
-                echo "::error::10_enable_susfs_for_ksu.patch does not apply to this KernelSU-Next revision."
-                echo "::error::SUSFS $SUSFS_VER expects a different KSU layout - pin KSU_REF or disable SUSFS."
-                exit 1
-            fi
-            patch -p1 -d "$KSU_DIR" <"$KSUP"
-        fi
+    # No KSU-side patch is applied here. SukiSU `builtin` implements SUSFS itself,
+    # and the ksu-next + SUSFS combination was already redirected to sukisu above
+    # (10_enable_susfs_for_ksu.patch targets weishu's older KernelSU layout and
+    # cannot apply to KernelSU-Next v3.x).
+    if [ ! -f "$KSU_DIR/kernel/Kconfig" ]; then
+        echo "::error::root tree missing at $KSU_DIR"; exit 1
     fi
+    if ! grep -q 'KSU_SUSFS' "$KSU_DIR/kernel/Kconfig"; then
+        echo "::error::$ROOT_FLAVOR tree has no KSU_SUSFS symbols in kernel/Kconfig."
+        echo "::error::kconfig would silently drop every CONFIG_KSU_SUSFS* line."
+        echo "::error::For SukiSU Ultra this means setup.sh did not check out the 'builtin' branch."
+        exit 1
+    fi
+    echo "    root tree provides KSU_SUSFS symbols"
+
+    # SUSFS README step 11: on GKI android14+ the protected-exports lists must be
+    # removed or modules like WiFi fail to load. Same failure class that
+    # MODULE_SIG_PROTECT=n addresses (fix-gki-config.sh); doing both is belt and braces.
+    for f in "$KDIR/android/abi_gki_protected_exports_aarch64" \
+             "$KDIR/android/abi_gki_protected_exports_x86_64"; do
+        [ -f "$f" ] && { rm -f "$f"; echo "    removed $(basename "$f")"; }
+    done
 
     for c in KSU_SUSFS KSU_SUSFS_SUS_PATH KSU_SUSFS_SUS_MOUNT KSU_SUSFS_SUS_KSTAT \
              KSU_SUSFS_SPOOF_UNAME KSU_SUSFS_ENABLE_LOG KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS \
@@ -119,3 +145,11 @@ fi
 
 echo "==> root integration done ($ROOT_FLAVOR, susfs=$USE_SUSFS, kpm=$USE_KPM)"
 grep -E '^CONFIG_(KSU|KPM)' "$DEFCONFIG" | sort
+
+# Export the flavor that was ACTUALLY used: it may differ from the workflow input
+# (ksu-next + SUSFS is redirected to sukisu above). Later steps must gate on the
+# effective value, or verify-build.sh would assert the wrong things.
+{
+    echo "EFFECTIVE_ROOT_FLAVOR=$ROOT_FLAVOR"
+    echo "EFFECTIVE_USE_KPM=$USE_KPM"
+} >>"${GITHUB_ENV:-/dev/null}"

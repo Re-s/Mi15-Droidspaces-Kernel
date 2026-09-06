@@ -353,3 +353,37 @@ profile (its independent choice of the `6_7_8` kABI variant agrees with the prob
 Also: `build/build.sh` **does not exist** on android15-6.6 manifests (the legacy build was
 removed), so kleaf/bazel is the only path. `check_defconfig` must be disabled in
 `common/BUILD.bazel` because the fragment is appended rather than sorted.
+
+## 13. KernelSU-Next v3.x cannot take the susfs4ksu KSU-side patch (observed in CI)
+
+First real CI run (`34026410717`) failed at *Apply root solution*. The kernel-side SUSFS patch
+`50_add_susfs_in_gki-android15-6.6.patch` applied cleanly to all ~25 files, then
+`10_enable_susfs_for_ksu.patch` failed its dry-run against KernelSU-Next at its latest tag
+(HEAD `3b18216f`, v3.3.0).
+
+Root cause, not an environment problem:
+
+- susfs4ksu's README states its patches are based on **"the original official KernelSU (the one
+  from weishu)"** at a release tag.
+- `10_enable_susfs_for_ksu.patch` **removes** `hook/lsm_hook.o`, `hook/syscall_event_bridge.o`,
+  `hook/syscall_hook_manager.o`, `hook/tp_marker.o`, `hook/arm64/*` and
+  `infra/symbol_resolver.o` from `kernel/Kbuild` — exactly the components KernelSU-Next v3.x
+  is architected around.
+- KernelSU-Next has no kernel-side SUSFS of its own: the only match in its tree is
+  `userspace/ksud/src/susfsd.rs`, and `kernel/Kconfig` contains no `KSU_SUSFS` symbol.
+
+Resolution: `ksu-next` + `use_susfs=true` is redirected to `sukisu` in `apply-root.sh`, since
+SukiSU Ultra's `builtin` branch defines all 19 `KSU_SUSFS*` Kconfig entries itself and needs no
+patch. Verified: `builtin` Kconfig has 19 `KSU_SUSFS` matches, `main` has 0 — which is why the
+script now hard-fails if the checked-out root tree lacks those symbols, instead of letting
+kconfig silently drop every `CONFIG_KSU_SUSFS*` line.
+
+Also fixed in the same pass:
+
+- **`abi_gki_protected_exports_{aarch64,x86_64}` are now deleted** when SUSFS is enabled.
+  susfs4ksu README step 11 requires this on GKI android14+ or "some modules like WiFi will not
+  work" — the same failure class `MODULE_SIG_PROTECT=n` addresses, from the other direction.
+- **The effective flavor is exported** via `EFFECTIVE_ROOT_FLAVOR` / `EFFECTIVE_USE_KPM`.
+  Because the redirect can change the flavor mid-run, later steps must gate on the effective
+  value; `verify-build.sh` had additionally been receiving no root env at all, so its
+  `CONFIG_KSU` / `CONFIG_KSU_SUSFS` / `CONFIG_KPM` assertions were being skipped silently.
