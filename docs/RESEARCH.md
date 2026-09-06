@@ -531,3 +531,20 @@ Fix (three parts, all serving "vendor modules must load"):
    "unknown symbol" against a trimmed table.
 3. Kernel release string equals stock (`-gb9cc6ec16bc8-abogki536571621-4k`) so
    even modules without a `__versions` section pass the full vermagic compare.
+
+### 16.1 Correction: MODVERSIONS=n also breaks vermagic - stub check_version() instead
+
+Run 34048958886 still black-screened. The MODVERSIONS=n config skipped the CRC
+compare but also removed the "modversions" token from the kernel vermagic
+(include/linux/vermagic.h). same_magic() (kernel/module/version.c) skips only
+the RELEASE token for CRC-carrying modules; the rest must strcmp equal:
+module "SMP preempt mod_unload modversions aarch64" vs kernel
+"SMP preempt mod_unload aarch64" -> every module rejected with "Invalid module
+format". Same symptom, different gate.
+
+Final scheme: keep CONFIG_MODVERSIONS=y (vermagic byte-identical to stock once
+the release string matches; TRIM_UNUSED_KSYMS stays off exactly as stock) and
+replace the body of check_version() in kernel/module/version.c with
+`return 1`. check_modstruct_version() routes module_layout through the same
+stub, so the very first gate ("disagrees about version of symbol
+module_layout") is dead too. genksyms still runs; its output is never compared.

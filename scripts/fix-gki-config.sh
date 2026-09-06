@@ -82,23 +82,69 @@ for c in KPROBES KALLSYMS KALLSYMS_ALL EXT4_FS; do
     fi
 done
 
-# 5. MODVERSIONS must be OFF. This is the fix for the flashed-kernel black screen.
+# 5. Skip module-CRC checks while KEEPING MODVERSIONS=y. This is the fix for the
+#    flashed-kernel black screen.
 #    Ground truth (research/ksymtab_crc2.py, stock Image vs AOSP-tag rebuild):
 #    87.8% of exported-symbol genksyms CRCs differ. Xiaomi builds their device
 #    kernel from MiCode's own tree, not the AOSP tag, and genksyms hashes SOURCE
 #    TOKENS - so no AOSP-tag rebuild can ever reproduce the CRCs their prebuilt
-#    vendor_dlkm modules record. A MODVERSIONS=y kernel then refuses every module
-#    at load ("disagrees about version of symbol") and the display/GPU never come
-#    up: exactly the observed boot-to-black-screen. With MODVERSIONS=n the CRC
-#    check is skipped entirely; what remains is binary-layout compatibility,
-#    which the ANDROID_KABI scheme guarantees (Droidspaces moves sysvipc into
-#    reserved slots - offsets and struct size are unchanged), and symbol
-#    presence is unaffected (exports still trimmed to the same KMI whitelist).
-#    caveat: this also means our own module ABI is unchecked; there are no
-#    out-of-tree modules of ours, so nothing is exposed.
-sed -i '/^CONFIG_MODVERSIONS=y$/d; /^# CONFIG_MODVERSIONS is not set$/d' "$DEFCONFIG"
-echo '# CONFIG_MODVERSIONS is not set' >>"$DEFCONFIG"
-echo "    MODVERSIONS: off (vendor module CRC parity is impossible across trees)"
+#    vendor_dlkm modules record. A stock kernel then refuses every module at
+#    load ("disagrees about version of symbol") and the display/GPU never come
+#    up: exactly the observed boot-to-black-screen.
+#    The first attempt (CONFIG_MODVERSIONS=n) skipped the CRC check but ALSO
+#    dropped the "modversions" token from the kernel's vermagic
+#    (include/linux/vermagic.h). same_magic() only skips the release token for
+#    CRC-carrying modules; the rest must match exactly, so every vendor module
+#    was then rejected with "Invalid module format" instead - same black screen
+#    with run 34048958886. So MODVERSIONS stays =y (vermagic identical to stock,
+#    TRIM_UNUSED_KSYMS off exactly as stock), and check_version() is stubbed to
+#    always return 1: CRC values are never compared. What remains is binary-
+#    layout compatibility, which the ANDROID_KABI scheme guarantees (Droidspaces
+#    fills reserved slots - offsets and struct size unchanged; SUSFS touches no
+#    headers), and symbol presence (trim_nonlisted_kmi=False in the kleaf
+#    target). genksyms still runs, its CRCs are simply never compared.
+#    caveat: our own out-of-tree modules would also skip CRC checks; there are
+#    none, so nothing is exposed.
+python3 - "$KDIR/kernel/module/version.c" <<'PY'
+import re, sys
+path = sys.argv[1]
+src = open(path, encoding="utf-8").read()
+stub = '''int check_version(const struct load_info *info,
+		  const char *symname,
+			 struct module *mod,
+			 const s32 *crc)
+{
+	/* Mi15: vendor-module CRC parity across trees is impossible (MiCode vs
+	 * AOSP tag; genksyms hashes source tokens). Layout compatibility is what
+	 * matters at runtime and is guaranteed by the ANDROID_KABI scheme. */
+	(void)info; (void)symname; (void)mod; (void)crc;
+	return 1;
+}
+'''
+pat = re.compile(r'int check_version\(const struct load_info \*info,.*?\n\}\n', re.S)
+if "vendor-module CRC parity" in src and "return 1;\n}\n" in src:
+    print("    check_version already stubbed")
+elif not pat.search(src):
+    print("::error::check_version() not found in kernel/module/version.c")
+    sys.exit(1)
+else:
+    out, n = pat.subn(stub, src, count=1)
+    assert n == 1
+    # The callers must survive: check_modstruct_version routes module_layout
+    # through the stub too, so "disagrees about version of symbol module_layout"
+    # is dead as well.
+    if "check_modstruct_version" not in out or "same_magic" not in out:
+        print("::error::stub rewrite broke version.c structure")
+        sys.exit(1)
+    open(path, "w", encoding="utf-8").write(out)
+    check = open(path, encoding="utf-8").read()
+    if "disagrees about version of symbol" in check:
+        print("::error::old check_version body still present")
+        sys.exit(1)
+    print("    check_version() stubbed to return 1 (CRC compare skipped)")
+PY
+grep -q '^CONFIG_MODVERSIONS=y$' "$DEFCONFIG" || echo 'CONFIG_MODVERSIONS=y' >>"$DEFCONFIG"
+echo "    MODVERSIONS: on (vermagic parity), CRC compare stubbed out"
 
 # 6. Disable the savedefconfig gate at its real source.
 #    We append options to gki_defconfig instead of inserting them in `savedefconfig`
