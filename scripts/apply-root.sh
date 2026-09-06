@@ -230,13 +230,18 @@ if [ "$USE_SUSFS" = "true" ]; then
     SUS="${SRC_CACHE:-/tmp}/susfs4ksu"
     if [ -d "$SUS/.git" ]; then
         echo "    susfs cache HIT ($SUS)"
-        # Unshallow the clone: the cached one was seeded with --depth=1 by older
-        # revisions of this script, and a plain fetch does not deepen it - the
-        # shallow graft then hides the pin's ancestry and the ancestor check
-        # fails (run 34048417781). --unshallow also fetches new history and is a
-        # no-op on an already complete repo; this patches-only repo is <1MB.
-        git -C "$SUS" fetch -q --unshallow origin "$SUSFS_BRANCH" \
+        # The cache may hold any of three states: shallow (seeded by older
+        # revisions), complete-but-stale (unshallowed by a previous run and
+        # saved), or complete-current. A plain fetch is always valid; unshallow
+        # is only valid on a still-shallow clone - "--unshallow on a complete
+        # repository" is a hard error (run 34051146826). This repo is <1MB with
+        # history, so deepening is cheap either way.
+        git -C "$SUS" fetch -q origin "$SUSFS_BRANCH" \
             || { echo "::error::susfs fetch of origin/$SUSFS_BRANCH failed"; exit 1; }
+        if [ "$(git -C "$SUS" rev-parse --is-shallow-repository)" = "true" ]; then
+            git -C "$SUS" fetch -q --unshallow origin "$SUSFS_BRANCH" \
+                || { echo "::error::susfs unshallow of origin/$SUSFS_BRANCH failed"; exit 1; }
+        fi
     else
         echo "    susfs cache MISS - cloning"
         mkdir -p "$(dirname "$SUS")"
