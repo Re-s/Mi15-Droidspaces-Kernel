@@ -154,15 +154,29 @@ jobs:
           # --reference against a cached mirror: repo hardlinks objects from it instead
           # of refetching ~1GB. --dissociate keeps the worktree independent of the
           # mirror afterwards, so a cache miss on a later run cannot corrupt the tree.
+          #
+          # Strip extensions.preciousObjects from the mirror first: repo sets it to
+          # protect its shared object stores, but it makes git refuse to delete packs
+          # during --dissociate ("cannot delete packs in a precious-objects repo"),
+          # which killed run 34045892578. The mirror is a disposable cache - unsetting
+          # is safe. If init still fails, fall back to a full fetch so a corrupt mirror
+          # can never block a build.
           REFARG=""
           if [ -d ~/gki-mirror/.repo ]; then
             echo "git mirror cache HIT ($(du -sh ~/gki-mirror | cut -f1))"
+            find ~/gki-mirror/.repo -name config -type f | while read -r f; do
+              git config --file "$f" --unset-all extensions.preciousObjects 2>/dev/null || true
+            done
             REFARG="--reference=$HOME/gki-mirror --dissociate"
           else
             echo "git mirror cache MISS - full fetch"
           fi
           repo init --depth=1 -u https://android.googlesource.com/kernel/manifest \
-              -b '${{ steps.res.outputs.manifest_branch }}' $REFARG
+              -b '${{ steps.res.outputs.manifest_branch }}' $REFARG \
+            || { echo "::warning::repo init with mirror failed; retrying with a full fetch";
+                 rm -rf ~/gki/.repo
+                 repo init --depth=1 -u https://android.googlesource.com/kernel/manifest \
+                     -b '${{ steps.res.outputs.manifest_branch }}'; }
           # Belt and braces: pin kernel/common to the exact tag regardless of what
           # the monthly manifest points at. Tracking a branch HEAD would let
           # vermagic/CRCs drift away from the vendor modules -> bootloop.
@@ -186,6 +200,11 @@ jobs:
             mkdir -p ~/gki-mirror
             cp -al ~/gki/.repo ~/gki-mirror/.repo 2>/dev/null \
               || cp -a ~/gki/.repo ~/gki-mirror/.repo
+            # Do not cache preciousObjects: it makes repo init --reference
+            # --dissociate fail on the next run (pack deletion is refused).
+            find ~/gki-mirror/.repo -name config -type f | while read -r f; do
+              git config --file "$f" --unset-all extensions.preciousObjects 2>/dev/null || true
+            done
             echo "mirror seeded: $(du -sh ~/gki-mirror | cut -f1)"
           else
             echo "mirror already present, leaving as-is"
