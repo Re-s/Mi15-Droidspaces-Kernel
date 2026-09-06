@@ -82,12 +82,36 @@ for c in KPROBES KALLSYMS KALLSYMS_ALL EXT4_FS; do
     fi
 done
 
-# 5. KMI strict mode and the savedefconfig check are NOT handled here.
-#    Under kleaf those come from `define_common_kernels(target_configs = {...})` in
-#    common/BUILD.bazel, not from the legacy build.config files (editing
-#    build.config.gki.aarch64 has no effect on a kleaf build — the legacy build.sh
-#    path does not exist on android15-6.6 at all). scripts/patch-bazel-target.py sets
-#    check_defconfig="disabled" and kmi_symbol_list_strict_mode=False on the
-#    kernel_aarch64 entry, and hard-fails if it cannot find it.
+# 5. Disable the savedefconfig gate at its real source.
+#    We append options to gki_defconfig instead of inserting them in `savedefconfig`
+#    order, so the check fails on ordering alone:
+#        ERROR: savedefconfig does not match common/arch/arm64/configs/gki_defconfig
+#
+#    This gate is NOT a bazel attribute. It is the legacy build-config hook
+#    `POST_DEFCONFIG_CMDS="check_defconfig"` in common/build.config.gki, which kleaf
+#    still evaluates. Note that `check_defconfig` also exists as a `kernel_build`
+#    attribute, but it cannot be reached from here: kernel_aarch64 is created by
+#    define_common_kernels(), and _define_common_kernel() does not forward that
+#    keyword (bazel rejects it outright). So the hook is the only lever.
+GKI_BC="$KDIR/build.config.gki"
+# -s, not -f: a 0-byte file must not pass. Upstream this file is 62 bytes:
+#   DEFCONFIG=gki_defconfig
+#   POST_DEFCONFIG_CMDS="check_defconfig"
+[ -s "$GKI_BC" ] || { echo "::error::$GKI_BC missing or empty; cannot disable the defconfig check"; exit 1; }
+
+# Require the positive precondition first. Asserting only that the old string is gone
+# would also "pass" on an empty or restructured file — a vacuous check.
+if grep -q 'POST_DEFCONFIG_CMDS' "$GKI_BC"; then
+    sed -i 's/POST_DEFCONFIG_CMDS="check_defconfig"/POST_DEFCONFIG_CMDS="true"/' "$GKI_BC"
+    if grep -q 'check_defconfig' "$GKI_BC"; then
+        echo "::error::failed to disable check_defconfig in $GKI_BC:"; cat "$GKI_BC"; exit 1
+    fi
+    echo "    check_defconfig gate disabled ($(grep POST_DEFCONFIG "$GKI_BC"))"
+else
+    echo "::error::no POST_DEFCONFIG_CMDS in $GKI_BC - build-config layout changed."
+    echo "::error::Refusing to build: the savedefconfig gate would reject our appended options."
+    cat "$GKI_BC"
+    exit 1
+fi
 
 echo "==> config alignment done"
