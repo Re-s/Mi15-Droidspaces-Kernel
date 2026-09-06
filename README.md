@@ -44,6 +44,14 @@ Actions → **Build Mi15 Droidspaces Kernel** → *Run workflow*.
 
 ### Flashing
 
+> **Use `fastboot flash boot`, never `fastboot boot`.** This is a GKI v4 device:
+> the DTB lives in `vendor_boot` and the generic ramdisk in `init_boot`, while
+> `boot.img` carries only the kernel. `fastboot boot boot.img` loads a single
+> image into RAM, so the kernel starts with **no device tree and no init** —
+> the result is a black screen even though the kernel itself is fine. Nothing is
+> written to the device by `fastboot boot`; long-press power (or `fastboot reboot`)
+> to recover.
+
 ```bash
 # unlocked bootloader required
 fastboot flash boot boot.img
@@ -52,6 +60,12 @@ fastboot reboot
 
 Keep the stock `boot.img`. If the device does not boot, `fastboot flash boot <stock>.img`
 restores it — the kernel lives only in `boot`, so nothing else is touched.
+
+`boot.img` is padded to the real partition size (96 MiB) and carries the full GKI
+signature set (embedded `boot` + `generic_kernel` vbmetas, partition-level AVB
+footer), byte-layout-verified against the stock dump — see `docs/RESEARCH.md §15`.
+It is signed with the public AOSP AVB test key; an unlocked bootloader skips
+verification, so this is for structural parity and a clean overwrite, not trust.
 
 The AnyKernel3 zip is the alternative route (recovery, or the KSU/SukiSU in-app flasher).
 

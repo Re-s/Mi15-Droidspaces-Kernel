@@ -449,3 +449,54 @@ building it: `CONFIG_KSU_FEATURE_ADBROOT` is a Kconfig macro used in `#ifdef`, n
 enum member, so the reference scan must exclude `CONFIG_`-prefixed matches.
 Verified: rejects `e2912817`, `d13e8a75`, `1a884658`, `2cf0f72d`; accepts `6c5603f0`
 and `4a6d3401`.
+
+## 15. boot.img completion: GKI signature, reverse-engineered from the stock dump
+
+`fastboot boot boot.img` produced a black screen on the device. Diagnosis: that is
+**expected** on this platform, not an image defect. GKI v4 splits the boot chain:
+DTB in `vendor_boot`, generic ramdisk in `init_boot`, kernel only in `boot`.
+`fastboot boot` loads a single image, so the kernel comes up with no DTB and no
+init. Nothing is written by `fastboot boot`; the correct test is
+`fastboot flash boot` (or the AnyKernel3 zip).
+
+The synthesized boot.img was still an unsigned 35 MB oddity next to the stock
+96 MiB signed image, so it was completed to match. The stock layout was parsed
+out of `/home/master/Downloads/os4.boot.b.img` and every inference was validated
+against real bytes:
+
+```
+[header page 4K][kernel page-padded][vbmeta 'boot'][vbmeta 'generic_kernel']
+[partition-level vbmeta + AVBf footer][zeros to 100663296]
+```
+
+Verified findings:
+
+* `vbmeta 'boot'`: descriptor `image_size` = header page + padded kernel
+  (36872192 for stock), `digest = sha256(salt ‖ content)` with **salt =
+  hex-decoded `d00df00d`** (4 bytes, not the ASCII string). Recomputed digest
+  matches the stock descriptor exactly.
+* `vbmeta 'generic_kernel'`: `image_size` = **raw kernel Image** (36866560);
+  digest over the kernel file alone, same salt. Matches stock exactly.
+* Props on both: `ARCH=arm64`, `BRANCH=` (empty), `KERNEL_RELEASE=<uname -r>`.
+* Descriptor arithmetic cross-check: on-disk sizes 368 B (boot: hash desc 176 +
+  props 48/40/104) and 376 B (generic_kernel: 184 + same props) — both reproduced
+  exactly by the avbtool encode rules (AvbHashDescriptor SIZE 132, round-8 padding;
+  AvbPropertyDescriptor SIZE 32, key/value as `!QQ`, NUL-terminated).
+* Auth block = hash(32) + sig(512), padded to 576; aux = descriptors + pubkey
+  (1032 = 4+4+512+512 for RSA4096), padded to 1408; auth hash = sha256(header ‖ aux)
+  — verified `MATCH` on both stock blobs.
+* Stock partition tail: standard `AVBf` footer, `orig_image_size=36888576`,
+  partition-level vbmeta is RSA2048 (2368 B). Ours is RSA4096 (2240 B) — the one
+  intentional deviation; both are structurally valid.
+* Regenerating the stock image from the stock kernel via our mkbootimg produces a
+  **byte-identical** header + kernel region, and the avbtool-generated embedded
+  digests are byte-identical to stock's. Only pubkey/signature bytes differ
+  (public AOSP AVB test key vs Xiaomi's release key — an unlocked bootloader
+  skips verification, so parity is not required).
+
+Implementation: `scripts/avb/avbtool.py` (vendored AOSP tool; stdlib + openssl
+only, no new CI deps) + `scripts/avb/testkey_rsa4096.pem`. `package.sh` now
+signs (two embedded vbmetas via `--do_not_append_vbmeta_image`), then adds the
+partition-level hash footer with `--partition_size 100663296`, which also pads
+the image to the real partition size so `fastboot flash boot` overwrites every
+stale byte. The verify block recomputes both digests from the final image.
