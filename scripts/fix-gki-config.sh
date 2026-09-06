@@ -82,12 +82,12 @@ for c in KPROBES KALLSYMS KALLSYMS_ALL EXT4_FS; do
     fi
 done
 
-# 5. Relax the KMI strict check: the Droidspaces kABI patch intentionally moves
-#    fields into padding, which shifts some CRCs. Vendor module matching still
-#    works (that is the whole point of the padding), but strict mode would abort.
-if [ -f "$KDIR/build.config.gki.aarch64" ]; then
-    sed -i 's/KMI_SYMBOL_LIST_STRICT_MODE=1/KMI_SYMBOL_LIST_STRICT_MODE=0/' \
-        "$KDIR/build.config.gki.aarch64" || true
-fi
+# 5. KMI strict mode and the savedefconfig check are NOT handled here.
+#    Under kleaf those come from `define_common_kernels(target_configs = {...})` in
+#    common/BUILD.bazel, not from the legacy build.config files (editing
+#    build.config.gki.aarch64 has no effect on a kleaf build — the legacy build.sh
+#    path does not exist on android15-6.6 at all). scripts/patch-bazel-target.py sets
+#    check_defconfig="disabled" and kmi_symbol_list_strict_mode=False on the
+#    kernel_aarch64 entry, and hard-fails if it cannot find it.
 
 echo "==> config alignment done"

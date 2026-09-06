@@ -130,18 +130,23 @@ jobs:
       - name: Align config with stock environment
         run: ./scripts/fix-gki-config.sh ~/gki '${{ inputs.kernel_name }}'
 
+      # kernel_aarch64 comes from define_common_kernels(target_configs = {...}), not a
+      # literal kernel_build(name = "kernel_aarch64"), so this needs a real parser
+      # rather than a sed that silently matches nothing.
+      - name: Prepare bazel target
+        run: python3 ./scripts/patch-bazel-target.py ~/gki/common/BUILD.bazel
+
       - name: Build kernel
         run: |
-          set -eux
+          set -euxo pipefail
           cd ~/gki
-          # savedefconfig gate: our fragment is appended, not sorted, so the check
-          # would fail on ordering alone.
-          grep -q 'check_defconfig = "disabled"' common/BUILD.bazel || \
-            sed -i '/name = "kernel_aarch64",/a\    check_defconfig = "disabled",' common/BUILD.bazel
           # build/build.sh no longer exists on android15-6.6 manifests; kleaf only.
+          # NB: `pipefail` is essential. Piping bazel into `tail` without it yields
+          # tail's exit status, so a failed build reports success and the real error
+          # only surfaces later as a confusing "built Image not found".
           tools/bazel build --config=fast \
             --disk_cache=/home/runner/.cache/bazel \
-            //common:kernel_aarch64/Image 2>&1 | tail -60
+            //common:kernel_aarch64/Image 2>&1 | tail -80
 
       - name: Verify build
         id: verify
