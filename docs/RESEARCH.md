@@ -570,3 +570,43 @@ lives in init_boot), so a temporary boot finds no init and panics. Only
 Packaging change: boot.img = [4K header][kernel][zeros to partition size].
 Verified byte-identical to a hand-built tail-less image. The whole AVB
 replication effort (§15) was the wrong turn for an unlocked device.
+
+## 18. What this bootloader actually accepts: a Xiaomi-signed vbmeta blob, stale hash and all
+
+Full on-device matrix (every row flashed with `fastboot flash boot`):
+
+| boot content | embedded tail | vbmeta partition | result |
+|---|---|---|---|
+| stock kernel | stock signed blob | stock | boots |
+| stock kernel | our testkey blob | stock | reboots to fastboot |
+| stock kernel | zeroed | stock | reboots to fastboot |
+| stock kernel | zeroed | flags=3 (verity+verification disabled) | reboots to fastboot |
+
+So the gate is the embedded vbmeta in the boot image, and the vbmeta partition
+flags do not influence it. The decisive evidence came from the device's OTHER
+slot, which held a third-party kernel (6.6.77-android15-8-Coolapk@GCross-
+Droidspaces). `avbtool info_image` on it:
+
+* Public key sha1 `de5be2a57e0cfbb83ec5c9523806eb6b7a72f809` - identical to the
+  stock image's key, i.e. Xiaomi's own AVB key, whose private half is not public.
+* Footer says `Original image size: 38031360`, but the hash descriptor inside
+  claims `Image Size: 37003264` - the descriptor describes a DIFFERENT image.
+
+A blob signed by Xiaomi's key that does not match the image it is attached to
+can only be a verbatim copy of a stock blob. Therefore this ABL verifies the
+blob's SIGNATURE and ignores its hash descriptor. (That kernel hangs at the logo
+under OS4 - a 6.6.77 kernel against OS4's 6.6.118 vendor modules - which is a
+different failure class from a bootloader rejection, and confirms the image was
+accepted and executed.)
+
+Packaging consequence (scripts/repack-stock-avb.py, wired into package.sh via
+STOCK_BOOT): emit [4K header][kernel][pad to 4K][stock vbmeta blob verbatim]
+[zeros][AVBf footer], with the footer's original_image_size and
+descriptor_offset moved to our blob offset. Everything else - including the
+signature - is stock bytes. Verified locally against both known-accepted images:
+same header shape, same footer invariants (orig == desc_off, desc_size 2368,
+4K-aligned blob, no kernel/blob overlap) and the same Xiaomi public key.
+
+Also settled earlier in the session: all the "black screen" reports were
+`fastboot boot` artifacts. On GKI v4 the boot partition holds no ramdisk, so a
+temporary boot has no init and panics. Only `fastboot flash boot` tests anything.

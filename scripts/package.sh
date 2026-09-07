@@ -39,55 +39,38 @@ has() { case ",$FORMATS," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
 
 # ------------------------------------------------------------------ boot.img
 if has bootimg; then
-    echo "==> building boot.img (header v$HEADER_VERSION, kernel only, zero tail)"
+    echo "==> building boot.img (header v$HEADER_VERSION, kernel only)"
 
     python3 "$SCRIPT_DIR/mkbootimg.py" \
         --header_version "$HEADER_VERSION" \
         --kernel "$IMAGE" \
         --out "$OUTDIR/boot.img"
 
-    # ------------------------------------------------------------ zero tail
-    # Do NOT replicate the stock AVB tail. Empirically established on this device
-    # (docs/RESEARCH.md §17, 2026-09-07):
-    #   * flash stock backup                            -> boots
-    #   * flash stock kernel + our testkey-signed tail  -> ABL drops to fastboot
-    # The header and kernel bytes were field-for-field identical in both, so the
-    # tail is the discriminator: this ABL verifies the embedded vbmeta signature
-    # even with an unlocked bootloader, and our AOSP test key can never satisfy
-    # it. The community magiskboot/AnyKernel3 flow works precisely because
-    # magiskboot zeroes the tail on repack - ABL finds no footer and skips AVB.
-    # So ship exactly that shape: header + kernel, zeros to the partition size.
-    # `fastboot flash boot` also zero-pads shorter images, so this matches what
-    # the standard custom-kernel flow produces on-device.
-    PART_SIZE="${BOOTIMG_PARTITION_SIZE:-100663296}"   # 96 MiB, stock boot partition
-    python3 - "$OUTDIR/boot.img" "$PART_SIZE" <<'PY'
-import sys
-boot, part_s = sys.argv[1], int(sys.argv[2])
-d = open(boot, 'rb').read()
-if len(d) < part_s:
-    open(boot, 'wb').write(d + b'\x00' * (part_s - len(d)))
-PY
+    # ------------------------------------------------- stock-signed AVB tail
+    # This bootloader checks the embedded vbmeta SIGNATURE but not its hash
+    # descriptor (docs/RESEARCH.md section 18). Established on-device:
+    #   stock backup                       -> boots
+    #   stock kernel + testkey-signed tail -> ABL drops to fastboot
+    #   stock kernel + zero tail           -> ABL drops to fastboot
+    #   + vbmeta partition flags=3         -> still fastboot (does not gate boot)
+    # The third-party kernel in the device's other slot boots far enough to hang
+    # at the logo (kernel/vendor version mismatch, NOT a rejection) and carries a
+    # vbmeta blob signed with Xiaomi's key (pubkey sha1 de5be2a5...) whose hash
+    # descriptor describes a different image - a verbatim stock blob with a stale
+    # hash. That is the only shape this ABL accepts, so reuse the stock blob
+    # bytes verbatim and only move the footer offsets to match our kernel size.
+    STOCK_BOOT="${STOCK_BOOT:-}"
+    PART_SIZE="${BOOTIMG_PARTITION_SIZE:-100663296}"
+    if [ -n "$STOCK_BOOT" ] && [ -f "$STOCK_BOOT" ]; then
+        python3 "$SCRIPT_DIR/repack-stock-avb.py" \
+            "$OUTDIR/boot.img" "$STOCK_BOOT" "$OUTDIR/boot.img.new"
+        mv -f "$OUTDIR/boot.img.new" "$OUTDIR/boot.img"
+    else
+        python3 "$SCRIPT_DIR/pad-image.py" "$OUTDIR/boot.img" "$PART_SIZE"
+        echo "::warning::no STOCK_BOOT given; the Xiaomi 15 bootloader will REJECT this image"
+    fi
 
-    # ------------------------------------------------------------------- verify
-    python3 - "$OUTDIR/boot.img" "$KVER" "$IMAGE" "$PART_SIZE" <<'PY'
-import struct, sys
-boot, kver, image, part_s = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
-d = open(boot, 'rb').read()
-raw = open(image, 'rb').read()
-assert d[:8] == b'ANDROID!', 'bad magic'
-ks, rs = struct.unpack_from('<2I', d, 8)
-hv, = struct.unpack_from('<I', d, 40)
-assert hv == 4, f'header_version {hv} != 4'
-assert rs == 0, f'ramdisk_size {rs} != 0 (boot carries kernel only)'
-assert ks == len(raw), f'kernel_size {ks} != source Image {len(raw)}'
-assert d[4096:4096 + ks] == raw, 'kernel payload differs from source Image'
-assert len(d) == part_s, f'image is {len(d)} bytes, expected partition size {part_s}'
-assert kver.encode() in d[:4096 + ks], 'kernel version string not found'
-assert d[4096 + ks:] == b'\x00' * (part_s - 4096 - ks), 'tail is not zero-padded'
-assert d[-64:-60] != b'AVBf', 'stale AVB footer present'
-print(f'    boot.img OK: header v{hv}, kernel {ks} bytes, {len(d)//1048576} MiB, '
-      f'zero tail (AVB skipped by bootloader)')
-PY
+    python3 "$SCRIPT_DIR/verify-bootimg.py" "$OUTDIR/boot.img" "$KVER" "$IMAGE" "$PART_SIZE"
     ls -lh "$OUTDIR/boot.img"
 fi
 
