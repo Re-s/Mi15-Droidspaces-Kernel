@@ -610,3 +610,44 @@ same header shape, same footer invariants (orig == desc_off, desc_size 2368,
 Also settled earlier in the session: all the "black screen" reports were
 `fastboot boot` artifacts. On GKI v4 the boot partition holds no ramdisk, so a
 temporary boot has no init and panics. Only `fastboot flash boot` tests anything.
+
+## 19. Stuck at the logo: 65 Xiaomi-private vendor hooks are missing
+
+With packaging solved (§18) the device finally executes our kernel, and the
+failure moved one layer up: it hangs at the boot logo instead of dropping to
+fastboot.
+
+Measured from the binaries themselves (`__traceiter_android_vh_*` and
+`__traceiter_android_rvh_*` occurrences in the raw Image):
+
+| kernel | vendor hooks |
+|---|---|
+| stock 6.6.118 (device) | 796 |
+| ours, AOSP android15-6.6 | 730 |
+| MiCode `dada-v-oss` (6.6.30) | 467 |
+
+Our build is missing 66 hooks that stock exports (65 confirmed absent by direct
+byte search); we export none that stock lacks. They cluster in memory and
+storage: 9 `mm_*`, 7 `folio_*`, 5 `cma_*`, 3 each of `fuse`/`lock`/`mmc`,
+2 each of `dma_heap`/`f2fs`/`filemap`/`mmap`/`rcu`, plus scheduler restricted
+hooks. Examples: `android_vh_cma_alloc_bypass`,
+`android_vh_dma_heap_buffer_alloc_lat_start`, `android_vh_mm_direct_reclaim_start`,
+`android_rvh_task_fits_cpu`, `android_vh_folio_start_writeback`,
+`android_vh_fuse_request_fetch`, `android_vh_mmc_blk_reset`.
+
+Vendor modules in vendor_dlkm reference these symbols, so they fail to load with
+"unknown symbol" - and the ones affected sit in memory management, DMA heaps and
+storage, i.e. exactly what early boot needs. That is the hang.
+
+This also explains why none of the module-compatibility work helped: the
+`check_version()` stub (skips CRC comparison), `trim_nonlisted_kmi=False` (keeps
+every symbol) and the byte-exact vermagic all address *matching* symbols. Here
+the symbols do not exist at all, so there is nothing to match. Verified: our
+vermagic is character-identical to stock
+(`6.6.118-android15-8-gb9cc6ec16bc8-abogki536571621-4k SMP preempt mod_unload
+modversions aarch64`) and we export 8609 identifiers against stock's 7168 -
+quantity was never the problem, identity is.
+
+MiCode's public `dada-v-oss` branch does not rescue this: it is 6.6.30 and
+covers only 457 of stock's 796 hooks (339 short), i.e. further away than
+upstream AOSP. Xiaomi has not published the OS4 / 6.6.118 source for dada.
