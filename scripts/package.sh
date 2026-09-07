@@ -39,104 +39,54 @@ has() { case ",$FORMATS," in *",$1,"*) return 0 ;; *) return 1 ;; esac; }
 
 # ------------------------------------------------------------------ boot.img
 if has bootimg; then
-    echo "==> building boot.img (header v$HEADER_VERSION, kernel only, GKI-signed)"
+    echo "==> building boot.img (header v$HEADER_VERSION, kernel only, zero tail)"
 
     python3 "$SCRIPT_DIR/mkbootimg.py" \
         --header_version "$HEADER_VERSION" \
         --kernel "$IMAGE" \
         --out "$OUTDIR/boot.img"
 
-    # ------------------------------------------------------------ GKI signature
-    # Replicates the stock Xiaomi 15 boot.img byte layout, reverse-engineered from
-    # the user's own dump and verified field-for-field (docs/RESEARCH.md §15):
-    #   [header page][kernel, page-padded][vbmeta 'boot'][vbmeta 'generic_kernel']
-    #   [partition-level vbmeta + AVBf footer][zeros to partition size]
-    #   * vbmeta 'boot'           digest = sha256(salt + header+kernel content)
-    #   * vbmeta 'generic_kernel' digest = sha256(salt + raw kernel Image)
-    #   * the partition-level hash footer also pads the image to the real
-    #     partition size, so `fastboot flash boot` overwrites every stale byte.
-    # For an identical kernel the generated digests are byte-identical to stock's
-    # (same salt d00df00d, same ARCH/BRANCH/KERNEL_RELEASE descriptor set). The
-    # signing key is the PUBLIC AOSP AVB test key: an unlocked bootloader skips
-    # verification, so Xiaomi's release key is not needed — the goal is that the
-    # image parses exactly like stock instead of being an unsigned 35 MB oddity.
-    AVB="$SCRIPT_DIR/avb/avbtool.py"
-    KEY="$SCRIPT_DIR/avb/testkey_rsa4096.pem"
+    # ------------------------------------------------------------ zero tail
+    # Do NOT replicate the stock AVB tail. Empirically established on this device
+    # (docs/RESEARCH.md §17, 2026-09-07):
+    #   * flash stock backup                            -> boots
+    #   * flash stock kernel + our testkey-signed tail  -> ABL drops to fastboot
+    # The header and kernel bytes were field-for-field identical in both, so the
+    # tail is the discriminator: this ABL verifies the embedded vbmeta signature
+    # even with an unlocked bootloader, and our AOSP test key can never satisfy
+    # it. The community magiskboot/AnyKernel3 flow works precisely because
+    # magiskboot zeroes the tail on repack - ABL finds no footer and skips AVB.
+    # So ship exactly that shape: header + kernel, zeros to the partition size.
+    # `fastboot flash boot` also zero-pads shorter images, so this matches what
+    # the standard custom-kernel flow produces on-device.
     PART_SIZE="${BOOTIMG_PARTITION_SIZE:-100663296}"   # 96 MiB, stock boot partition
-    command -v openssl >/dev/null 2>&1 \
-        || { echo "::error::openssl is required to sign boot.img"; exit 1; }
-    [ -f "$AVB" ] && [ -f "$KEY" ] \
-        || { echo "::error::vendored avbtool or test key missing"; exit 1; }
-
-    SIG="$OUTDIR/.sigs"; mkdir -p "$SIG"
-    for np in "boot:$OUTDIR/boot.img" "generic_kernel:$IMAGE"; do
-        name="${np%%:*}"; img="${np#*:}"
-        python3 "$AVB" add_hash_footer \
-            --partition_name "$name" --dynamic_partition_size \
-            --image "$img" --algorithm SHA256_RSA4096 --key "$KEY" \
-            --salt d00df00d \
-            --prop ARCH:arm64 --prop BRANCH: --prop "KERNEL_RELEASE:$KVER" \
-            --do_not_append_vbmeta_image --output_vbmeta_image "$SIG/$name.bin"
-    done
-    cat "$SIG/boot.bin" "$SIG/generic_kernel.bin" >> "$OUTDIR/boot.img"
-
-    # Partition-level hash footer; also pads the image to $PART_SIZE.
-    python3 "$AVB" add_hash_footer \
-        --partition_name boot --partition_size "$PART_SIZE" \
-        --image "$OUTDIR/boot.img" --algorithm SHA256_RSA4096 --key "$KEY" \
-        --salt d00df00d \
-        --prop ARCH:arm64 --prop BRANCH: --prop "KERNEL_RELEASE:$KVER"
-    rm -rf "$SIG"
+    python3 - "$OUTDIR/boot.img" "$PART_SIZE" <<'PY'
+import sys
+boot, part_s = sys.argv[1], int(sys.argv[2])
+d = open(boot, 'rb').read()
+if len(d) < part_s:
+    open(boot, 'wb').write(d + b'\x00' * (part_s - len(d)))
+PY
 
     # ------------------------------------------------------------------- verify
     python3 - "$OUTDIR/boot.img" "$KVER" "$IMAGE" "$PART_SIZE" <<'PY'
-import hashlib, struct, sys
+import struct, sys
 boot, kver, image, part_s = sys.argv[1], sys.argv[2], sys.argv[3], int(sys.argv[4])
 d = open(boot, 'rb').read()
+raw = open(image, 'rb').read()
 assert d[:8] == b'ANDROID!', 'bad magic'
 ks, rs = struct.unpack_from('<2I', d, 8)
 hv, = struct.unpack_from('<I', d, 40)
 assert hv == 4, f'header_version {hv} != 4'
 assert rs == 0, f'ramdisk_size {rs} != 0 (boot carries kernel only)'
-assert ks > 1_000_000, f'kernel_size {ks} implausible'
+assert ks == len(raw), f'kernel_size {ks} != source Image {len(raw)}'
+assert d[4096:4096 + ks] == raw, 'kernel payload differs from source Image'
 assert len(d) == part_s, f'image is {len(d)} bytes, expected partition size {part_s}'
 assert kver.encode() in d[:4096 + ks], 'kernel version string not found'
-
-# embedded signature region: two vbmetas right after the padded kernel
-content = 4096 + -(-ks // 4096) * 4096
-assert d[content:content + 4] == b'AVB0', 'embedded boot signature missing'
-assert d[content + 2240:content + 2244] == b'AVB0', 'embedded generic_kernel signature missing'
-assert d[-64:-60] == b'AVBf', 'partition-level AVB footer missing'
-
-# digest parity: recompute what the descriptors claim
-salt = bytes.fromhex('d00df00d')
-def hash_digest(vb):
-    auth, aux = struct.unpack_from('!2Q', vb, 12)
-    do, ds = struct.unpack_from('!2Q', vb, 96)
-    a = vb[256 + auth:256 + auth + aux]
-    p = do
-    while p < do + ds:
-        tag, nbf = struct.unpack_from('!QQ', a, p)
-        body = a[p + 16:p + 16 + nbf]
-        if tag == 2:
-            isz, alg, nl, sl, dl, fl = struct.unpack_from('!Q32sLLLL', body, 0)
-            o = 116
-            return (body[o:o + nl].decode(), isz, body[o + nl:o + nl + sl],
-                    body[o + nl + sl:o + nl + sl + dl])
-        p += 16 + nbf
-    return None
-
-hd = hash_digest(d[content:])                       # 'boot'
-assert hd[0] == 'boot' and hd[1] == content, 'boot descriptor mismatch'
-assert hashlib.sha256(hd[2] + d[:content]).digest() == hd[3], 'boot digest mismatch'
-
-gk = hash_digest(d[content + 2240:])                # 'generic_kernel'
-raw = open(image, 'rb').read()
-assert gk[0] == 'generic_kernel' and gk[1] == len(raw), 'generic_kernel descriptor mismatch'
-assert hashlib.sha256(gk[2] + raw).digest() == gk[3], 'generic_kernel digest mismatch'
-
+assert d[4096 + ks:] == b'\x00' * (part_s - 4096 - ks), 'tail is not zero-padded'
+assert d[-64:-60] != b'AVBf', 'stale AVB footer present'
 print(f'    boot.img OK: header v{hv}, kernel {ks} bytes, {len(d)//1048576} MiB, '
-      f'GKI-signed (boot+generic_kernel+footer), digests verified')
+      f'zero tail (AVB skipped by bootloader)')
 PY
     ls -lh "$OUTDIR/boot.img"
 fi

@@ -548,3 +548,25 @@ replace the body of check_version() in kernel/module/version.c with
 `return 1`. check_modstruct_version() routes module_layout through the same
 stub, so the very first gate ("disagrees about version of symbol
 module_layout") is dead too. genksyms still runs; its output is never compared.
+
+## 17. The bootloader enforces the embedded vbmeta even unlocked - ship a zero tail
+
+Test matrix (2026-09-07, all with `fastboot flash boot`):
+* flash stock backup os4.boot.b.img            -> boots
+* flash stock kernel + our testkey-signed tail -> ABL drops to fastboot
+
+Header and kernel bytes were field-for-field / sha256 identical in both images
+(first differing byte: the avbtool release string inside the vbmeta), so the
+tail alone is the discriminator. This ABL verifies the boot image's embedded
+vbmeta signature even with an unlocked bootloader, and the AOSP test key can
+never satisfy it. The community magiskboot/AnyKernel3 flow works because
+magiskboot zeroes the tail on repack - with no footer the bootloader skips AVB.
+
+Also discovered: earlier "black screen" reports were an artifact of testing
+with `fastboot boot` - on GKI v4 the boot image carries no ramdisk (ramdisk
+lives in init_boot), so a temporary boot finds no init and panics. Only
+`fastboot flash boot` is a valid test.
+
+Packaging change: boot.img = [4K header][kernel][zeros to partition size].
+Verified byte-identical to a hand-built tail-less image. The whole AVB
+replication effort (§15) was the wrong turn for an unlocked device.
